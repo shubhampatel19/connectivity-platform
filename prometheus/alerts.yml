@@ -1,0 +1,58 @@
+# Alerts are the entry point of every drill: something fires, you start from
+# the dashboard, and work inward. Thresholds are tuned for the default
+# 200-device fleet; adjust if you change DEVICE_COUNT.
+groups:
+  - name: connectivity
+    rules:
+      - alert: IngestionErrorRateHigh
+        expr: |
+          sum(rate(connectivity_ingest_http_requests_total{code=~"5.."}[2m]))
+            / clamp_min(sum(rate(connectivity_ingest_http_requests_total[2m])), 1e-9) > 0.05
+        for: 2m
+        labels: { severity: page }
+        annotations:
+          summary: More than 5% of ingestion requests are failing with 5xx.
+
+      - alert: AgentSendFailures
+        expr: sum(rate(connectivity_agent_send_failures_total[2m])) > 0.5
+        for: 2m
+        labels: { severity: page }
+        annotations:
+          summary: Devices are failing to deliver telemetry and are buffering locally.
+
+      - alert: AgentDroppingSamples
+        expr: sum(rate(connectivity_agent_samples_dropped_total[5m])) > 0
+        for: 1m
+        labels: { severity: page }
+        annotations:
+          summary: Device buffers are full and overwriting data. This is data loss.
+
+      - alert: ConsumerLagHigh
+        expr: sum(kafka_consumergroup_lag{consumergroup="telemetry-processor"}) > 2000
+        for: 3m
+        labels: { severity: page }
+        annotations:
+          summary: The processor is falling behind Kafka.
+
+      - alert: ProcessorRetrying
+        expr: sum(rate(connectivity_processor_retries_total[2m])) > 0
+        for: 2m
+        labels: { severity: ticket }
+        annotations:
+          summary: The processor is retrying records; a dependency is failing.
+
+      - alert: IngestToStoreSlow
+        expr: |
+          histogram_quantile(0.95,
+            sum by (le) (rate(connectivity_processor_ingest_to_store_seconds_bucket[5m]))) > 30
+        for: 5m
+        labels: { severity: ticket }
+        annotations:
+          summary: p95 time from ingestion to storage is above 30s.
+
+      - alert: TargetDown
+        expr: up == 0
+        for: 1m
+        labels: { severity: page }
+        annotations:
+          summary: "{{ $labels.job }} is not being scraped."

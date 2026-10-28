@@ -1,0 +1,151 @@
+# Connectivity, Phase 1: edge agents -> ingest API -> Kafka -> telemetry
+# processor -> Postgres, with Prometheus and Grafana watching all of it.
+#
+# Service images build from sibling clones of each component repo. Run
+# scripts/bootstrap.sh once to set up that layout.
+name: connectivity
+
+services:
+  # ---------- cloud: data plane ----------
+  kafka:
+    image: apache/kafka:3.8.0
+    hostname: kafka
+    ports:
+      - "29092:29092" # for tools on your host
+    environment:
+      CLUSTER_ID: MkU3OEVBNTcwNTJENDM2Qk
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093,HOST://:29092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,HOST://localhost:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT,HOST:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 > /dev/null 2>&1"]
+      interval: 10s
+      timeout: 20s
+      retries: 12
+      start_period: 20s
+    restart: unless-stopped
+
+  # Topics are created explicitly: partition counts matter for ordering,
+  # parallelism and some of the failure drills.
+  kafka-init:
+    image: apache/kafka:3.8.0
+    depends_on:
+      kafka: { condition: service_healthy }
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic telemetry.raw --partitions 6 --replication-factor 1
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic device.events --partitions 3 --replication-factor 1
+        echo "topics ready"
+    restart: "no"
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: connectivity
+      POSTGRES_PASSWORD: connectivity
+      POSTGRES_DB: connectivity
+    ports:
+      - "5432:5432"
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+      # The telemetry processor owns the schema.
+      - ../connectivity-telemetry-processor/migrations:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U connectivity -d connectivity"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  # ---------- cloud: services ----------
+  ingest-api:
+    build: ../connectivity-ingest-api
+    image: connectivity/ingest-api:dev
+    environment:
+      KAFKA_BROKERS: kafka:9092
+      TOKEN_SECRET: ${TOKEN_SECRET:-dev-token-secret-change-me}
+      ENROLLMENT_KEY: ${ENROLLMENT_KEY:-dev-enrollment-key}
+      LOG_LEVEL: ${INGEST_LOG_LEVEL:-info}
+    ports:
+      - "8080:8080"
+    depends_on:
+      kafka-init: { condition: service_completed_successfully }
+    restart: unless-stopped
+
+  telemetry-processor:
+    build: ../connectivity-telemetry-processor
+    image: connectivity/telemetry-processor:dev
+    environment:
+      KAFKA_BROKERS: kafka:9092
+      DATABASE_URL: postgres://connectivity:connectivity@postgres:5432/connectivity?sslmode=disable
+      LOG_LEVEL: ${PROCESSOR_LOG_LEVEL:-info}
+    ports:
+      - "9101:9101"
+    depends_on:
+      kafka-init: { condition: service_completed_successfully }
+      postgres: { condition: service_healthy }
+    restart: unless-stopped
+
+  # ---------- edge ----------
+  edge-agent:
+    build: ../connectivity-edge-agent
+    image: connectivity/edge-agent:dev
+    environment:
+      INGEST_URL: http://ingest-api:8080
+      ENROLLMENT_KEY: ${ENROLLMENT_KEY:-dev-enrollment-key}
+      SITE_ID: site-a
+      DEVICE_COUNT: ${DEVICE_COUNT:-200}
+      SEND_INTERVAL: ${SEND_INTERVAL:-5s}
+      LOG_LEVEL: ${AGENT_LOG_LEVEL:-info}
+    ports:
+      - "9102:9102"
+    depends_on:
+      - ingest-api
+    restart: unless-stopped
+
+  # ---------- observability ----------
+  kafka-exporter:
+    image: danielqsj/kafka-exporter:v1.7.0
+    command: ["--kafka.server=kafka:9092"]
+    depends_on:
+      kafka-init: { condition: service_completed_successfully }
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:v2.53.0
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
+    ports:
+      - "9090:9090"
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:11.1.0
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /etc/grafana/provisioning/dashboards/connectivity-overview.json
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+
+volumes:
+  pg-data:
