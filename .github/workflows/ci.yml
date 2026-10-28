@@ -1,0 +1,89 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Shell scripts
+        run: shellcheck scripts/*.sh
+      - name: Prometheus config and alert rules
+        run: |
+          docker run --rm -v "$PWD/prometheus:/etc/prometheus:ro" \
+            --entrypoint promtool prom/prometheus:v2.53.0 \
+            check config /etc/prometheus/prometheus.yml
+      - name: Grafana dashboard JSON
+        run: python3 -m json.tool grafana/provisioning/dashboards/connectivity-overview.json > /dev/null
+
+  # Runs the whole stack the way `make up` does and checks that telemetry from
+  # simulated devices actually lands in Postgres.
+  smoke:
+    needs: lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      DEVICE_COUNT: "50"
+      SEND_INTERVAL: 2s
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: connectivity-platform
+
+      - name: Clone component repos
+        run: |
+          for repo in connectivity-edge-agent connectivity-ingest-api connectivity-telemetry-processor; do
+            git clone --depth 1 "https://github.com/${{ github.repository_owner }}/$repo.git"
+          done
+
+      - name: Start the stack
+        working-directory: connectivity-platform
+        run: docker compose up -d --build
+
+      - name: Wait for telemetry in Postgres
+        working-directory: connectivity-platform
+        run: |
+          q() { docker compose exec -T postgres psql -U connectivity -d connectivity -tAc "$1" 2>/dev/null || echo 0; }
+          for _ in $(seq 1 60); do
+            [ "$(q 'SELECT count(*) FROM telemetry')" -gt 0 ] && break
+            sleep 5
+          done
+          echo "devices registered: $(q 'SELECT count(*) FROM devices')"
+          echo "batches stored:     $(q 'SELECT count(*) FROM ingested_batches')"
+          echo "samples stored:     $(q 'SELECT count(*) FROM telemetry')"
+          [ "$(q 'SELECT count(*) FROM telemetry')" -gt 0 ] || { echo "::error::no telemetry reached Postgres within 5 minutes"; exit 1; }
+          [ "$(q 'SELECT count(*) FROM devices')" -gt 0 ] || { echo "::error::no devices were registered"; exit 1; }
+          # Batch markers and samples commit in one transaction, so these must always agree.
+          [ "$(q 'SELECT (SELECT coalesce(sum(sample_count),0) FROM ingested_batches) = (SELECT count(*) FROM telemetry)')" = t ] \
+            || { echo "::error::sample count does not match batch markers"; exit 1; }
+
+      - name: Check every Prometheus target is up
+        run: |
+          for _ in $(seq 1 24); do
+            if curl -s localhost:9090/api/v1/targets | python3 -c 'import json,sys; t=json.load(sys.stdin)["data"]["activeTargets"]; h={x["labels"]["job"]: x["health"] for x in t}; print(h); sys.exit(0 if h and all(v == "up" for v in h.values()) else 1)'; then
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "::error::some Prometheus targets are not up"
+          exit 1
+
+      - name: Check the ingest API is ready
+        run: curl -fsS -o /dev/null localhost:8080/readyz && echo "readyz ok"
+
+      - name: Diagnostics
+        if: failure()
+        working-directory: connectivity-platform
+        run: |
+          docker compose ps -a
+          docker compose logs --no-color --tail=60
+
+      - name: Tear down
+        if: always()
+        working-directory: connectivity-platform
+        run: docker compose down -v
