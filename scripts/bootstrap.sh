@@ -11,16 +11,18 @@
 #   ├── connectivity-edge-agent/
 #   ├── connectivity-ingest-api/
 #   ├── connectivity-telemetry-processor/
+#   ├── connectivity-case-service/
 #   └── connectivity-site-gateway/       (Java, not part of go.work)
 set -euo pipefail
 
-OWNER="${OWNER:-spr732}"
+OWNER="${OWNER:-shubhampatel19}"
 GO_REPOS=(
   connectivity-contracts
   connectivity-go-kit
   connectivity-edge-agent
   connectivity-ingest-api
   connectivity-telemetry-processor
+  connectivity-case-service
 )
 OTHER_REPOS=(
   connectivity-site-gateway
@@ -42,8 +44,11 @@ done
 if [[ ! -f go.work ]]; then
   go work init "${GO_REPOS[@]/#/./}"
   echo "created go.work"
+else
+  # Adds repos that are new since go.work was created; a no-op for the rest.
+  go work use "${GO_REPOS[@]/#/./}"
 fi
 
 echo
 echo "Workspace ready: $WORKSPACE"
-echo "Next: cd connectivity-platform && make tidy && make test && make up"
+echo "Next: cd connectivity-platform && make test && make up"

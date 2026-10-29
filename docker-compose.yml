@@ -1,6 +1,7 @@
 # Connectivity: edge agents -> ingest API -> Kafka -> telemetry processor ->
 # Postgres, with log bundles in an S3-compatible object store (SeaweedFS),
-# and Prometheus and Grafana watching all of it.
+# device alerts turned into support cases by the case service, and
+# Prometheus and Grafana watching all of it.
 #
 # Two edge sites: site A's devices talk to the cloud directly; site B's
 # devices talk to an on-site gateway (Java) that stores and forwards.
@@ -52,6 +53,7 @@ services:
         /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic telemetry.raw --partitions 6 --replication-factor 1
         /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic device.events --partitions 3 --replication-factor 1
         /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic bundles.uploaded --partitions 3 --replication-factor 1
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic device.alerts --partitions 3 --replication-factor 1
         echo "topics ready"
     restart: "no"
 
@@ -64,7 +66,8 @@ services:
     ports:
       - "5432:5432"
     volumes:
-      # The telemetry processor creates and migrates the schema on startup.
+      # The telemetry processor and the case service each create and migrate
+      # their own tables on startup (the case service's live in schema "cases").
       - pg-data:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U connectivity -d connectivity"]
@@ -127,6 +130,25 @@ services:
       postgres: { condition: service_healthy }
     restart: unless-stopped
 
+  # Device alerts -> support cases. Rules come from case-service/rules.json:
+  # edit it and `make restart s=case-service` to change thresholds.
+  case-service:
+    build: ../connectivity-case-service
+    image: connectivity/case-service:dev
+    environment:
+      KAFKA_BROKERS: kafka:9092
+      DATABASE_URL: postgres://connectivity:connectivity@postgres:5432/connectivity?sslmode=disable
+      RULES_FILE: /etc/case-service/rules.json
+      LOG_LEVEL: ${CASE_LOG_LEVEL:-info}
+    volumes:
+      - ./case-service/rules.json:/etc/case-service/rules.json:ro
+    ports:
+      - "8085:8085"
+    depends_on:
+      kafka-init: { condition: service_completed_successfully }
+      postgres: { condition: service_healthy }
+    restart: unless-stopped
+
   # ---------- edge: site A, devices talk to the cloud directly ----------
   edge-agent:
     build: ../connectivity-edge-agent
@@ -139,6 +161,7 @@ services:
       SEND_INTERVAL: ${SEND_INTERVAL:-5s}
       BUNDLE_INTERVAL: ${BUNDLE_INTERVAL:-30m}
       BUNDLE_TRACE_BYTES: ${BUNDLE_TRACE_BYTES:-2097152}
+      FAULT_RATE: ${FAULT_RATE:-1}
       LOG_LEVEL: ${AGENT_LOG_LEVEL:-info}
     ports:
       - "9102:9102"
@@ -177,6 +200,7 @@ services:
       SEND_INTERVAL: ${SEND_INTERVAL:-5s}
       BUNDLE_INTERVAL: ${BUNDLE_INTERVAL:-30m}
       BUNDLE_TRACE_BYTES: ${BUNDLE_TRACE_BYTES:-2097152}
+      FAULT_RATE: ${FAULT_RATE:-1}
       LOG_LEVEL: ${AGENT_LOG_LEVEL:-info}
     ports:
       - "9103:9102"

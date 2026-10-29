@@ -18,7 +18,7 @@ tests:
         exp_alerts:
           - exp_labels: { severity: ticket, site: site-b }
             exp_annotations:
-              summary: "The site-b gateway is holding 7200 batches the cloud hasn't accepted."
+              summary: "The site-b gateway is holding 7200 records the cloud hasn't accepted."
               description: Normal during a cloud outage. If the cloud is up, check the upstream outcome panel and forward failures.
       - eval_time: 10m
         alertname: GatewayBacklogNotDraining
@@ -67,7 +67,7 @@ tests:
         exp_alerts:
           - exp_labels: { severity: page, site: site-b, reason: evicted }
             exp_annotations:
-              summary: "The site-b gateway discarded queued telemetry (reason: evicted). This is data loss."
+              summary: "The site-b gateway discarded queued telemetry or alerts (reason: evicted). This is data loss."
       - eval_time: 3m
         alertname: GatewayHttpSaturated
         exp_alerts:
@@ -107,3 +107,70 @@ tests:
           - exp_labels: { severity: page, site: site-a }
             exp_annotations:
               summary: "Devices at site-a are failing to deliver telemetry and are buffering locally."
+  # Alerts path: site B devices drop alerts, the case service lags, a site case opens.
+  - interval: 30s
+    input_series:
+      - series: 'connectivity_agent_alerts_dropped_total{job="edge-agent",site="site-b"}'
+        values: '0 0 3 3 3'
+      - series: 'connectivity_agent_alerts_dropped_total{job="edge-agent",site="site-a"}'
+        values: '0x4'
+      - series: 'kafka_consumergroup_lag{job="kafka",consumergroup="case-service",topic="device.alerts",partition="0"}'
+        values: '0+20x20'
+      - series: 'kafka_consumergroup_lag{job="kafka",consumergroup="telemetry-processor",topic="telemetry.raw",partition="0"}'
+        values: '0+20x20'
+      - series: 'connectivity_case_cases_opened_total{job="case-service",rule="thermal-critical",scope="site"}'
+        values: '0 0 1 1 1'
+      - series: 'connectivity_case_cases_opened_total{job="case-service",rule="thermal-critical",scope="device"}'
+        values: '0 4 4 9 9'
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: AgentAlertsDropped
+        exp_alerts:
+          - exp_labels: { severity: page, site: site-b }
+            exp_annotations:
+              summary: "Devices at site-b discarded alerts because their outbox was full. Those faults will never reach support."
+      - eval_time: 2m
+        alertname: SiteCaseOpened
+        exp_alerts:
+          - exp_labels: { severity: page, rule: thermal-critical }
+            exp_annotations:
+              summary: "Many devices at one site raised thermal-critical together, and a site-wide case was opened."
+              description: Several devices failing at once usually share a cause (cooling, power). Start from the site case's device list.
+      - eval_time: 8m
+        alertname: CaseServiceLag
+        exp_alerts:
+          - exp_labels: { severity: page }
+            exp_annotations:
+              summary: The case service is falling behind on alerts; new faults are not becoming cases.
+  # A case waiting 40 minutes for its logs; alerts held at the edge; stale gauges.
+  - interval: 1m
+    input_series:
+      - series: 'connectivity_case_waiting_for_logs_oldest_seconds{job="case-service"}'
+        values: '2400x10'
+      - series: 'connectivity_agent_alerts_pending{job="edge-agent",site="site-a"}'
+        values: '4x15'
+      - series: 'connectivity_agent_alerts_pending{job="edge-agent",site="site-b"}'
+        values: '0x15'
+      - series: 'connectivity_case_stats_last_success_timestamp_seconds{job="case-service"}'
+        values: '0x15'
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: CasesWaitingForLogs
+        exp_alerts:
+          - exp_labels: { severity: ticket }
+            exp_annotations:
+              summary: An open case has waited more than 30 minutes for the log bundle its device collected.
+              description: The bundle is stuck at the edge (spool, gateway pass-through) or in the cloud (object store, bundles.uploaded). Follow the bundle ID from the case.
+      - eval_time: 11m
+        alertname: AgentAlertsStuck
+        exp_alerts:
+          - exp_labels: { severity: ticket, site: site-a }
+            exp_annotations:
+              summary: "Devices at site-a have held undelivered alerts for 10 minutes."
+              description: Check the agent's alert send failures by reason. endpoint_missing means the cloud (or gateway) doesn't have /v1/alerts.
+      - eval_time: 5m
+        alertname: CaseGaugesStale
+        exp_alerts:
+          - exp_labels: { severity: ticket }
+            exp_annotations:
+              summary: The case service hasn't refreshed its open-case gauges for 2 minutes; the Cases panels are showing old numbers.

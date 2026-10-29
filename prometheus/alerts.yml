@@ -100,7 +100,7 @@ groups:
         for: 3m
         labels: { severity: ticket }
         annotations:
-          summary: "The {{ $labels.site }} gateway is holding {{ $value }} batches the cloud hasn't accepted."
+          summary: "The {{ $labels.site }} gateway is holding {{ $value }} records the cloud hasn't accepted."
           description: Normal during a cloud outage. If the cloud is up, check the upstream outcome panel and forward failures.
 
       - alert: GatewayBacklogNotDraining
@@ -118,7 +118,7 @@ groups:
         expr: sum by (site, reason) (increase(connectivity_gateway_queue_dropped_total[10m])) > 0
         labels: { severity: page }
         annotations:
-          summary: "The {{ $labels.site }} gateway discarded queued telemetry (reason: {{ $labels.reason }}). This is data loss."
+          summary: "The {{ $labels.site }} gateway discarded queued telemetry or alerts (reason: {{ $labels.reason }}). This is data loss."
 
       - alert: GatewayHttpSaturated
         expr: |
@@ -154,3 +154,74 @@ groups:
         labels: { severity: ticket }
         annotations:
           summary: "More than 10% of the devices the {{ $labels.site }} gateway knows about have gone silent."
+
+  # Device alerts and support cases. A fault that never becomes a case is
+  # invisible to support, so the alert path is watched end to end: devices
+  # holding or losing alerts, the cloud refusing them, the case service
+  # falling behind, and cases that open without their logs.
+  - name: cases
+    rules:
+      - alert: AgentAlertsDropped
+        expr: sum by (site) (increase(connectivity_agent_alerts_dropped_total[10m])) > 0
+        labels: { severity: page }
+        annotations:
+          summary: "Devices at {{ $labels.site }} discarded alerts because their outbox was full. Those faults will never reach support."
+
+      - alert: AgentAlertsStuck
+        expr: sum by (site) (connectivity_agent_alerts_pending) > 0
+        for: 10m
+        labels: { severity: ticket }
+        annotations:
+          summary: "Devices at {{ $labels.site }} have held undelivered alerts for 10 minutes."
+          description: Check the agent's alert send failures by reason. endpoint_missing means the cloud (or gateway) doesn't have /v1/alerts.
+
+      - alert: AlertsRejected
+        expr: |
+          sum(increase(connectivity_ingest_alerts_rejected_total[10m]))
+            + sum(increase(connectivity_case_alerts_rejected_total[10m])) > 0
+        labels: { severity: ticket }
+        annotations:
+          summary: The cloud is refusing device alerts as invalid. Usually an agent release sending something the contract doesn't allow.
+
+      - alert: CaseServiceLag
+        expr: sum(kafka_consumergroup_lag{consumergroup="case-service"}) > 100
+        for: 3m
+        labels: { severity: page }
+        annotations:
+          summary: The case service is falling behind on alerts; new faults are not becoming cases.
+
+      - alert: CaseServiceRetrying
+        expr: sum(rate(connectivity_case_retries_total[2m])) > 0
+        for: 2m
+        labels: { severity: ticket }
+        annotations:
+          summary: The case service is retrying records; a dependency (usually Postgres) is failing.
+
+      - alert: CaseDecisionSlow
+        expr: histogram_quantile(0.95, sum by (le) (rate(connectivity_case_alert_delay_seconds_bucket[5m]))) > 60
+        for: 5m
+        labels: { severity: ticket }
+        annotations:
+          summary: p95 time from an alert reaching the cloud to a case decision is above 60s.
+
+      - alert: SiteCaseOpened
+        expr: sum by (rule) (increase(connectivity_case_cases_opened_total{scope="site"}[10m])) > 0
+        labels: { severity: page }
+        annotations:
+          summary: "Many devices at one site raised {{ $labels.rule }} together, and a site-wide case was opened."
+          description: Several devices failing at once usually share a cause (cooling, power). Start from the site case's device list.
+
+      - alert: CasesWaitingForLogs
+        expr: max(connectivity_case_waiting_for_logs_oldest_seconds) > 1800
+        for: 5m
+        labels: { severity: ticket }
+        annotations:
+          summary: An open case has waited more than 30 minutes for the log bundle its device collected.
+          description: The bundle is stuck at the edge (spool, gateway pass-through) or in the cloud (object store, bundles.uploaded). Follow the bundle ID from the case.
+
+      - alert: CaseGaugesStale
+        expr: time() - max(connectivity_case_stats_last_success_timestamp_seconds) > 120
+        for: 2m
+        labels: { severity: ticket }
+        annotations:
+          summary: The case service hasn't refreshed its open-case gauges for 2 minutes; the Cases panels are showing old numbers.

@@ -6,7 +6,7 @@
   ],
   "timezone": "browser",
   "schemaVersion": 39,
-  "version": 3,
+  "version": 4,
   "refresh": "5s",
   "time": {
     "from": "now-30m",
@@ -891,7 +891,7 @@
       "id": 20,
       "type": "timeseries",
       "title": "Site gateway: queued, forwarded, dropped",
-      "description": "Batches per second into and out of the queue. Any drop is data loss.",
+      "description": "Records per second into and out of the queue, telemetry and alerts. Any drop is data loss.",
       "datasource": {
         "type": "prometheus",
         "uid": "prom"
@@ -924,8 +924,8 @@
             "type": "prometheus",
             "uid": "prom"
           },
-          "expr": "sum(rate(connectivity_gateway_queued_total{job=\"site-gateway\"}[1m]))",
-          "legendFormat": "queued/s"
+          "expr": "sum by (kind) (rate(connectivity_gateway_queued_total{job=\"site-gateway\"}[1m]))",
+          "legendFormat": "queued/s {{kind}}"
         },
         {
           "refId": "B",
@@ -933,8 +933,8 @@
             "type": "prometheus",
             "uid": "prom"
           },
-          "expr": "sum(rate(connectivity_gateway_forwarded_total{job=\"site-gateway\"}[1m]))",
-          "legendFormat": "forwarded/s"
+          "expr": "sum by (kind) (rate(connectivity_gateway_forwarded_total{job=\"site-gateway\"}[1m]))",
+          "legendFormat": "forwarded/s {{kind}}"
         },
         {
           "refId": "C",
@@ -1295,6 +1295,427 @@
           },
           "expr": "process_open_fds{job=\"site-gateway\"}",
           "legendFormat": "open fds"
+        }
+      ]
+    },
+    {
+      "id": 101,
+      "type": "row",
+      "title": "Alerts and cases",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 105
+      },
+      "panels": []
+    },
+    {
+      "id": 27,
+      "type": "timeseries",
+      "title": "Alerts at the edge: raised, sent, held, failing",
+      "description": "Per site over 5 minutes. Pending alerts sit in device outboxes; failures show why (endpoint_missing = no /v1/alerts where the device points).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prom"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 106
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prom"
+          },
+          "expr": "sum by (site) (increase(connectivity_agent_alerts_raised_total[5m]))",
+          "legendFormat": "raised {{site}}"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prom"
+          },
+          "expr": "sum by (site) (increase(connectivity_agent_alerts_sent_total[5m]))",
+          "legendFormat": "sent {{site}}"
+        },
+        {
+          "refId": "C",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prom"
+          },
+          "expr": "sum by (site) (connectivity_agent_alerts_pending)",
+          "legendFormat": "pending {{site}}"
+        },
+        {
+          "refId": "D",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prom"
+          },
+          "expr": "sum by (site, reason) (increase(connectivity_agent_alert_send_failures_total[5m]))",
+          "legendFormat": "failed {{site}} {{reason}}"
+        }
+      ]
+    },
+    {
+      "id": 28,
+      "type": "timeseries",
+      "title": "Case service: alerts by outcome",
+      "description": "What the rules decided over 5 minutes. duplicate = a retry, redelivery or replay that changed nothing.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prom"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 106
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prom"
+          },
+          "expr": "sum by (outcome) (increase(connectivity_case_alerts_total[5m]))",
+          "legendFormat": "{{outcome}}"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prom"
+          },
+          "expr": "sum by (reason) (increase(connectivity_case_alerts_rejected_total[5m]))",
+          "legendFormat": "rejected {{reason}}"
+        }
+      ]
+    },
+    {
+      "id": 29,
+      "type": "timeseries",
+      "title": "Cases: open by rule and scope",
+      "description": "Open cases right now. A site case stands for many devices.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prom"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 114
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prom"
+          },
+          "expr": "sum by (rule, scope) (connectivity_case_open_cases)",
+          "legendFormat": "{{rule}} ({{scope}})"
+        }
+      ]
+    },
+    {
+      "id": 30,
+      "type": "timeseries",
+      "title": "Cases: opened by rule and scope",
+      "description": "Cases opened over 5 minutes.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prom"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 114
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prom"
+          },
+          "expr": "sum by (rule, scope) (increase(connectivity_case_cases_opened_total[5m]))",
+          "legendFormat": "{{rule}} ({{scope}})"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prom"
+          },
+          "expr": "increase(connectivity_case_device_cases_adopted_total[5m])",
+          "legendFormat": "device cases adopted by a site case"
+        }
+      ]
+    },
+    {
+      "id": 31,
+      "type": "timeseries",
+      "title": "Cases: waiting for logs",
+      "description": "Open cases whose log bundle hasn't arrived, and how long the oldest has waited (minutes).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prom"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 122
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prom"
+          },
+          "expr": "max(connectivity_case_waiting_for_logs)",
+          "legendFormat": "cases waiting"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prom"
+          },
+          "expr": "max(connectivity_case_waiting_for_logs_oldest_seconds) / 60",
+          "legendFormat": "oldest wait (min)"
+        }
+      ]
+    },
+    {
+      "id": 32,
+      "type": "timeseries",
+      "title": "Case service: consumer lag by topic",
+      "description": "Alerts and bundle events not yet processed. Growing lag = faults not yet cases.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prom"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 122
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prom"
+          },
+          "expr": "sum by (topic) (kafka_consumergroup_lag{consumergroup=\"case-service\"})",
+          "legendFormat": "{{topic}}"
+        }
+      ]
+    },
+    {
+      "id": 33,
+      "type": "timeseries",
+      "title": "Case service: alert to decision p50 / p95",
+      "description": "From the ingest API accepting an alert to the case service deciding on it.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prom"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 130
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prom"
+          },
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(connectivity_case_alert_delay_seconds_bucket[5m])))",
+          "legendFormat": "p50"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prom"
+          },
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(connectivity_case_alert_delay_seconds_bucket[5m])))",
+          "legendFormat": "p95"
+        }
+      ]
+    },
+    {
+      "id": 34,
+      "type": "timeseries",
+      "title": "Case service: retries and record duration p95",
+      "description": "Retries mean the database is failing; the partition waits rather than skip ahead.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prom"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 130
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prom"
+          },
+          "expr": "sum by (topic) (rate(connectivity_case_retries_total[1m]))",
+          "legendFormat": "retries/s {{topic}}"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prom"
+          },
+          "expr": "histogram_quantile(0.95, sum by (le, topic) (rate(connectivity_case_record_duration_seconds_bucket[5m])))",
+          "legendFormat": "record p95 (s) {{topic}}"
         }
       ]
     }

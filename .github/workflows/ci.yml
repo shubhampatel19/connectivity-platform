@@ -10,7 +10,7 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Shell scripts
         run: shellcheck scripts/*.sh
       - name: Prometheus config and alert rules
@@ -28,7 +28,9 @@ jobs:
 
   # Runs the whole stack the way `make up` does and checks that telemetry from
   # simulated devices actually lands in Postgres, from both sites, including
-  # site B's data that the gateway held through a cloud outage.
+  # site B's data that the gateway held through a cloud outage; that device
+  # faults become exactly the cases they should; and that replaying every
+  # alert changes nothing.
   smoke:
     needs: lint
     runs-on: ubuntu-latest
@@ -39,14 +41,16 @@ jobs:
       SEND_INTERVAL: 2s
       BUNDLE_INTERVAL: 20s
       BUNDLE_TRACE_BYTES: "262144"
+      # No spontaneous faults: every alert in this run is one the test injected.
+      FAULT_RATE: "0"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           path: connectivity-platform
 
       - name: Clone component repos
         run: |
-          for repo in connectivity-edge-agent connectivity-ingest-api connectivity-telemetry-processor connectivity-site-gateway; do
+          for repo in connectivity-edge-agent connectivity-ingest-api connectivity-telemetry-processor connectivity-site-gateway connectivity-case-service; do
             git clone --depth 1 "https://github.com/${{ github.repository_owner }}/$repo.git"
           done
 
@@ -94,6 +98,50 @@ jobs:
           [ "$stored" = "$size" ] || { echo "::error::$key is '$stored' bytes in the object store but the index says $size"; exit 1; }
           echo "object in the object store matches the index"
 
+      - name: "Alerts become cases: one device, then a site-wide storm through the gateway"
+        working-directory: connectivity-platform
+        run: |
+          api()  { curl -fsS "localhost:8085$1"; }
+          py()   { python3 -c "$1"; }
+          for _ in $(seq 1 24); do curl -fsS -o /dev/null localhost:8085/readyz && break; sleep 5; done
+          curl -fsS -o /dev/null localhost:8085/readyz || { echo "::error::the case service never became ready"; exit 1; }
+
+          # 1. One overheating device at site A: exactly one device case, and its log bundle attaches.
+          dev=$(curl -fsS -X POST 'localhost:9102/debug/faults?kind=thermal&devices=1' | py 'import json,sys; print(json.load(sys.stdin)["devices"][0])')
+          echo "injected an overheat on $dev"
+          dev_cases() { api "/v1/cases?status=all&device=$dev"; }
+          for _ in $(seq 1 36); do [ "$(dev_cases | py 'import json,sys; print(len(json.load(sys.stdin)["cases"]))')" -ge 1 ] && break; sleep 5; done
+          read -r n scope rule id <<<"$(dev_cases | py 'import json,sys; c=json.load(sys.stdin)["cases"]; print(len(c), *( (c[0]["scope"], c[0]["rule_id"], c[0]["case_id"]) if c else ("-","-","-")))')"
+          echo "cases for $dev: $n ($scope, $rule, #$id)"
+          [ "$n" = 1 ] && [ "$scope" = device ] && [ "$rule" = thermal-critical ] \
+            || { echo "::error::one overheat on $dev should open exactly one thermal device case, got $n ($scope $rule)"; exit 1; }
+          for _ in $(seq 1 36); do [ "$(api "/v1/cases/$id" | py 'import json,sys; print(json.load(sys.stdin)["logs"])')" = attached ] && break; sleep 5; done
+          logs=$(api "/v1/cases/$id" | py 'import json,sys; print(json.load(sys.stdin)["logs"])')
+          [ "$logs" = attached ] || { echo "::error::case #$id never got its log bundle (logs: $logs)"; exit 1; }
+
+          # 2. Every site B device overheats at once, through the gateway: one site case, not 30.
+          hit=$(curl -fsS -X POST 'localhost:9103/debug/faults?kind=thermal&devices=all' | py 'import json,sys; print(len(json.load(sys.stdin)["devices"]))')
+          echo "injected an overheat on all $hit site B devices"
+          storm() {
+            api "/v1/cases?status=open&site=site-b&rule=thermal-critical&limit=500" | py '
+          import json, sys
+          c = json.load(sys.stdin)["cases"]
+          site = [x for x in c if x["scope"] == "site"]
+          dev = [x for x in c if x["scope"] == "device"]
+          orphans = [x for x in dev if not site or x.get("parent_case_id") != site[0]["case_id"]]
+          print(len(site), site[0]["devices"] if site else 0, len(dev), len(orphans), site[0]["case_id"] if site else "-")'
+          }
+          for _ in $(seq 1 36); do read -r sites devices dcases orphans sid <<<"$(storm)"; [ "$sites" -ge 1 ] && [ "$devices" -ge "$hit" ] && break; sleep 5; done
+          read -r sites devices dcases orphans sid <<<"$(storm)"
+          echo "site B: $sites site case(s), #$sid covering $devices devices; $dcases device cases, $orphans not under it"
+          echo "::notice title=storm::site case #$sid covers $devices of $hit site B devices; $dcases device cases opened before it, all adopted: $([ "$orphans" = 0 ] && echo yes || echo no)"
+          [ "$sites" = 1 ] || { echo "::error::expected exactly one open site case for site B, got $sites"; exit 1; }
+          [ "$devices" -ge "$hit" ] || { echo "::error::the site case covers $devices devices, expected all $hit"; exit 1; }
+          [ "$dcases" -lt 5 ] || { echo "::error::$dcases device cases opened at site B; the storm rule should stop at 4"; exit 1; }
+          [ "$orphans" = 0 ] || { echo "::error::$orphans site B device cases are not children of the site case"; exit 1; }
+          [ "$(api '/v1/cases?status=open&site=site-a&rule=thermal-critical' | py 'import json,sys; print(sum(x["scope"] == "site" for x in json.load(sys.stdin)["cases"]))')" = 0 ] \
+            || { echo "::error::site A got a site case from a single device"; exit 1; }
+
       - name: "Store-and-forward: site B through a cloud outage"
         working-directory: connectivity-platform
         run: |
@@ -110,10 +158,16 @@ jobs:
           [ "$(gm connectivity_gateway_queue_records)" -eq 0 ] || { echo "::error::the gateway has a backlog while the cloud is healthy"; exit 1; }
           queued0=$(gm connectivity_gateway_queued_total); fwd0=$(gm connectivity_gateway_forwarded_total)
 
-          # 2. Cloud outage: the gateway keeps acking site B and queues to disk.
+          # 2. Cloud outage: the gateway keeps acking site B and queues to disk,
+          #    including an alert raised mid-outage (checked in the next step).
           t0=$(date +%s)
           docker compose stop ingest-api
+          curl -fsS -X POST 'localhost:9103/debug/faults?kind=disk&devices=1' | python3 -c 'import json,sys; print(json.load(sys.stdin)["devices"][0])' > /tmp/outage-device
+          echo "injected a disk fault on $(cat /tmp/outage-device) during the outage"
           sleep 45
+          alerts_queued=$(curl -s localhost:8090/metrics | awk '/^connectivity_gateway_queued_total\{kind="alerts"\}/ {print int($2)}')
+          echo "alerts queued at the gateway during the outage: ${alerts_queued:-0}"
+          [ "${alerts_queued:-0}" -ge 1 ] || { echo "::error::the gateway did not queue the alert raised during the outage"; exit 1; }
           backlog=$(gm connectivity_gateway_queue_records)
           echo "after 45s of outage the gateway holds $backlog batches"
           [ "$backlog" -gt 0 ] || { echo "::error::the gateway did not queue anything during the outage"; exit 1; }
@@ -144,6 +198,40 @@ jobs:
           [ "$(q 'SELECT (SELECT coalesce(sum(sample_count),0) FROM ingested_batches) = (SELECT count(*) FROM telemetry)')" = t ] \
             || { echo "::error::sample count does not match batch markers after the outage"; exit 1; }
 
+      - name: An alert queued at the gateway during the outage became a case
+        working-directory: connectivity-platform
+        run: |
+          dev=$(cat /tmp/outage-device)
+          disk_cases() { curl -fsS "localhost:8085/v1/cases?status=all&device=$dev&rule=disk-reallocating" | python3 -c 'import json,sys; print(len(json.load(sys.stdin)["cases"]))'; }
+          for _ in $(seq 1 24); do [ "$(disk_cases)" -ge 1 ] && break; sleep 5; done
+          [ "$(disk_cases)" = 1 ] || { echo "::error::the disk fault $dev raised during the outage did not become exactly one case (got $(disk_cases))"; exit 1; }
+          pending=$(curl -s localhost:9103/metrics | awk '/^connectivity_agent_alerts_pending / {print int($2)}')
+          echo "disk case for $dev opened after the outage; site B alerts still pending at the edge: $pending"
+          [ "$pending" = 0 ] || { echo "::error::site B devices still hold $pending alerts after recovery"; exit 1; }
+
+      - name: Replaying every alert from offset 0 changes nothing
+        working-directory: connectivity-platform
+        run: |
+          q() { docker compose exec -T postgres psql -U connectivity -d connectivity -tAc "$1"; }
+          snapshot() { q "SELECT count(*) || ' ' || coalesce(sum(alert_count), 0) || ' ' || count(*) FILTER (WHERE status = 'open') FROM cases.cases"; }
+          before=$(snapshot); recorded=$(q 'SELECT count(*) FROM cases.alerts')
+          docker compose stop case-service
+          # The reset needs the group empty; a member that hasn't left yet makes it fail, so retry briefly.
+          for _ in $(seq 1 12); do
+            docker compose exec -T kafka /opt/kafka/bin/kafka-consumer-groups.sh --bootstrap-server localhost:9092 \
+              --group case-service --reset-offsets --to-earliest --all-topics --execute > /tmp/reset.log 2>&1 && break
+            sleep 5
+          done
+          grep -q "device.alerts" /tmp/reset.log || { cat /tmp/reset.log; echo "::error::could not reset the case-service offsets"; exit 1; }
+          docker compose start case-service
+          dups() { curl -s localhost:8085/metrics | awk '/^connectivity_case_alerts_total\{outcome="duplicate"\}/ {print int($2)}'; }
+          for _ in $(seq 1 36); do [ "$(dups)" -ge "$recorded" ] 2>/dev/null && break; sleep 5; done
+          after=$(snapshot)
+          echo "replayed $(dups) alerts as duplicates (recorded: $recorded); cases/alerts/open before: $before, after: $after"
+          echo "::notice title=replay::$(dups) of $recorded recorded alerts replayed as duplicates; cases, alert counts, open: $before -> $after"
+          [ "$(dups)" -ge "$recorded" ] || { echo "::error::only $(dups) of $recorded alerts were replayed within 3 minutes"; exit 1; }
+          [ "$before" = "$after" ] || { echo "::error::replaying alerts changed the cases: $before -> $after"; exit 1; }
+
       - name: Check every Prometheus target is up
         run: |
           for _ in $(seq 1 24); do
@@ -155,8 +243,8 @@ jobs:
           echo "::error::some Prometheus targets are not up"
           exit 1
 
-      - name: Check the ingest API is ready
-        run: curl -fsS -o /dev/null localhost:8080/readyz && echo "readyz ok"
+      - name: Check the ingest API and case service are ready
+        run: curl -fsS -o /dev/null localhost:8080/readyz && curl -fsS -o /dev/null localhost:8085/readyz && echo "readyz ok"
 
       - name: Diagnostics
         if: failure()
