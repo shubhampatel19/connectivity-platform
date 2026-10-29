@@ -45,7 +45,6 @@ mkdir connectivity && cd connectivity
 git clone https://github.com/spr732/connectivity-platform.git
 cd connectivity-platform
 make bootstrap   # clones the other repos next to this one, creates ../go.work
-make tidy        # generates go.sum in each module (commit these)
 make test        # unit tests with the race detector, every module
 make up          # builds images and starts 12 containers
 ```
