@@ -1,6 +1,6 @@
 # Connectivity
 
-A mock edge-to-cloud telemetry system, built to break on purpose. Simulated field devices stream hardware telemetry to a cloud backend. Every layer is instrumented so you can practice diagnosing production failures using only dashboards, logs and alerts.
+A mock edge-to-cloud telemetry system, built to break on purpose. Simulated field devices stream hardware telemetry to a cloud backend and upload log bundles for support. Every layer is instrumented so you can practice diagnosing production failures using only dashboards, logs and alerts.
 
 This repo holds the local platform: the compose stack, Prometheus, Grafana, alert rules, and the workspace tooling that ties the component repos together.
 
@@ -8,9 +8,13 @@ This repo holds the local platform: the compose stack, Prometheus, Grafana, aler
  EDGE                          CLOUD
 ┌──────────────┐  HTTPS   ┌────────────┐       ┌─────────┐       ┌─────────────┐      ┌──────────┐
 │ edge-agent   │ ───────▶ │ ingest-api │ ────▶ │  Kafka  │ ────▶ │ telemetry-  │ ───▶ │ Postgres │
-│ 200 devices  │  JSON    │ auth,      │ acks  │ 6 + 3   │ group │ processor   │ tx   │ dedup by │
-│ (goroutines) │          │ validate   │ =all  │ parts   │       │ at-least-1x │      │ batch_id │
-└──────────────┘          └────────────┘       └─────────┘       └─────────────┘      └──────────┘
+│ 200 devices  │ telemetry│ auth,      │ acks  │ 3 topics│ group │ processor   │ tx   │ dedup by │
+│ (goroutines) │ + chunked│ validate   │ =all  │         │       │ at-least-1x │      │ batch_id │
+│ disk spool   │ bundles  └─────┬──────┘       └─────────┘       └─────────────┘      └──────────┘
+└──────────────┘                │ chunks, assembled bundles
+                          ┌─────▼──────┐
+                          │   MinIO    │
+                          └────────────┘
         └──────────── Prometheus scrapes everything ──── Grafana dashboard + alert rules ─────┘
 ```
 
@@ -38,7 +42,7 @@ cd connectivity-platform
 make bootstrap   # clones the other repos next to this one, creates ../go.work
 make tidy        # generates go.sum in each module (commit these)
 make test        # unit tests with the race detector, every module
-make up          # builds images and starts 9 containers
+make up          # builds images and starts 10 containers
 ```
 
 After about a minute:
@@ -50,7 +54,8 @@ After about a minute:
 | Ingest API | http://localhost:8080 (`/healthz`, `/readyz`, `/metrics`) |
 | Telemetry processor metrics | http://localhost:9101/metrics |
 | Edge agent metrics | http://localhost:9102/metrics |
-| Postgres | `make psql` |
+| MinIO console | http://localhost:9001 (user `connectivity`, password `connectivity-secret`) |
+| Postgres | `make psql`, or `make bundles` for the latest log bundles |
 
 Check that data is flowing:
 
@@ -81,6 +86,11 @@ SELECT (SELECT sum(sample_count) FROM ingested_batches) AS expected,
        (SELECT count(*) FROM telemetry) AS actual;
 ```
 
+**4. Object store outage.** Use `BUNDLE_INTERVAL=1m make up` so bundles flow constantly, then `make stop s=minio` for 5 minutes.
+Telemetry should be completely unaffected, and `/readyz` should stay 200, which is a deliberate design choice (see the ingest API README). `ObjectStoreErrors` should fire, and the edge spool backlog should climb. After `make start s=minio`, the backlog should drain, alert bundles first. Question to answer: how long until the spool hits `SPOOL_MAX_BUNDLES` and `BundlesEvicted` fires?
+
+**5. Agent crash mid-upload.** Make bundles big enough to catch in flight: `BUNDLE_INTERVAL=1m BUNDLE_TRACE_BYTES=33554432 make up`. Wait for uploads to start (the chunk latency panel moves), then `make kill s=edge-agent` and `make start s=edge-agent`. Spooled bundles should resume where they stopped. Count chunk PUTs in the ingest API logs (`LOG_LEVEL=debug`) to confirm only the missing chunks were resent.
+
 ## Design decisions that matter during incidents
 
 - **Batch IDs are idempotency keys.** A device assigns `batch_id` once and reuses it on every retry. The processor records batch IDs in the same transaction as the samples, so retries and replays are absorbed instead of double-counted.
@@ -90,12 +100,14 @@ SELECT (SELECT sum(sample_count) FROM ingested_batches) AS expected,
 - **Devices drop oldest data when full.** Buffers are bounded, as on real hardware with fixed memory. Drops are counted and alerted on.
 - **4xx is permanent, 5xx is transient.** The agent drops a batch the backend rejects with 4xx, so one bad batch can't wedge its queue. It retries 5xx responses, timeouts and 429s.
 - **The fleet is de-synchronized.** Devices start at random offsets and back off with jitter, so recovery from an outage doesn't stampede.
+- **Log uploads resume, and the cloud keeps no session state in memory.** Upload sessions live in MinIO, chunks are checksummed one by one, and the assembled bundle is verified against the device's declared SHA-256 before anything is published.
+- **Log bundles can't hurt telemetry.** They use a separate, capped worker pool at the edge, and the ingest API's readiness doesn't depend on MinIO.
 - **Liveness and readiness are separate.** `/healthz` stays up when Kafka is down, while `/readyz` reports it. Restarting the process wouldn't fix a dependency outage.
 
 ## Roadmap
 
 1. **Phase 1 (done): direct path.** Edge agent, ingest API, Kafka, telemetry processor, Postgres, metrics, alerts.
-2. **Log bundles.** Chunked, resumable uploads to MinIO, with an event published to Kafka.
+2. **Phase 2 (done): log bundles.** Devices collect logs on a schedule and on thermal faults, spool them to disk, and upload them in resumable, checksummed chunks to MinIO. The processor indexes them in Postgres.
 3. **Site gateway** (`connectivity-site-gateway`). Device discovery, inventory, store-and-forward with a disk buffer, and a single upstream connection. Devices choose direct or gateway mode.
 4. **Alerts to cases** (`connectivity-case-service`). A rules engine and a case service with deduplication.
 5. **Production platform.** Move the cloud side to k3d. Add Toxiproxy on the WAN link, Chaos Mesh, Loki for logs and Tempo for traces.

@@ -30,6 +30,8 @@ jobs:
     env:
       DEVICE_COUNT: "50"
       SEND_INTERVAL: 2s
+      BUNDLE_INTERVAL: 20s
+      BUNDLE_TRACE_BYTES: "262144"
     steps:
       - uses: actions/checkout@v4
         with:
@@ -61,6 +63,22 @@ jobs:
           # Batch markers and samples commit in one transaction, so these must always agree.
           [ "$(q 'SELECT (SELECT coalesce(sum(sample_count),0) FROM ingested_batches) = (SELECT count(*) FROM telemetry)')" = t ] \
             || { echo "::error::sample count does not match batch markers"; exit 1; }
+
+      - name: Wait for a log bundle in Postgres and MinIO
+        working-directory: connectivity-platform
+        run: |
+          q() { docker compose exec -T postgres psql -U connectivity -d connectivity -tAc "$1" 2>/dev/null || echo 0; }
+          for _ in $(seq 1 60); do
+            [ "$(q 'SELECT count(*) FROM log_bundles')" -gt 0 ] && break
+            sleep 5
+          done
+          [ "$(q 'SELECT count(*) FROM log_bundles')" -gt 0 ] || { echo "::error::no log bundle was indexed within 5 minutes"; exit 1; }
+          read -r key size <<<"$(q "SELECT object_key || ' ' || size_bytes FROM log_bundles ORDER BY indexed_at LIMIT 1")"
+          echo "bundles indexed: $(q 'SELECT count(*) FROM log_bundles'); checking $key ($size bytes)"
+          docker compose exec -T minio mc alias set local http://localhost:9000 connectivity connectivity-secret > /dev/null
+          stored=$(docker compose exec -T minio mc stat --json "local/log-bundles/$key" | python3 -c 'import json,sys; print(json.load(sys.stdin)["size"])')
+          [ "$stored" = "$size" ] || { echo "::error::$key is $stored bytes in MinIO but the index says $size"; exit 1; }
+          echo "object in MinIO matches the index"
 
       - name: Check every Prometheus target is up
         run: |

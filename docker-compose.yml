@@ -1,5 +1,6 @@
-# Connectivity, Phase 1: edge agents -> ingest API -> Kafka -> telemetry
-# processor -> Postgres, with Prometheus and Grafana watching all of it.
+# Connectivity: edge agents -> ingest API -> Kafka -> telemetry processor ->
+# Postgres, with log bundles stored in MinIO, and Prometheus and Grafana
+# watching all of it.
 #
 # Service images build from sibling clones of each component repo. Run
 # scripts/bootstrap.sh once to set up that layout.
@@ -47,6 +48,7 @@ services:
         set -e
         /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic telemetry.raw --partitions 6 --replication-factor 1
         /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic device.events --partitions 3 --replication-factor 1
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic bundles.uploaded --partitions 3 --replication-factor 1
         echo "topics ready"
     restart: "no"
 
@@ -59,13 +61,32 @@ services:
     ports:
       - "5432:5432"
     volumes:
+      # The telemetry processor creates and migrates the schema on startup.
       - pg-data:/var/lib/postgresql/data
-      # The telemetry processor owns the schema.
-      - ../connectivity-telemetry-processor/migrations:/docker-entrypoint-initdb.d:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U connectivity -d connectivity"]
       interval: 5s
       timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  # Object storage for log bundles (S3 API on 9000, web console on 9001).
+  minio:
+    image: minio/minio:RELEASE.2025-04-22T22-12-26Z
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: ${S3_ACCESS_KEY:-connectivity}
+      MINIO_ROOT_PASSWORD: ${S3_SECRET_KEY:-connectivity-secret}
+      MINIO_PROMETHEUS_AUTH_TYPE: public
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
       retries: 20
     restart: unless-stopped
 
@@ -77,11 +98,17 @@ services:
       KAFKA_BROKERS: kafka:9092
       TOKEN_SECRET: ${TOKEN_SECRET:-dev-token-secret-change-me}
       ENROLLMENT_KEY: ${ENROLLMENT_KEY:-dev-enrollment-key}
+      S3_ENDPOINT: minio:9000
+      S3_ACCESS_KEY: ${S3_ACCESS_KEY:-connectivity}
+      S3_SECRET_KEY: ${S3_SECRET_KEY:-connectivity-secret}
+      S3_BUCKET: log-bundles
       LOG_LEVEL: ${INGEST_LOG_LEVEL:-info}
     ports:
       - "8080:8080"
     depends_on:
       kafka-init: { condition: service_completed_successfully }
+      # Started, not healthy: telemetry must flow even while MinIO is down.
+      minio: { condition: service_started }
     restart: unless-stopped
 
   telemetry-processor:
@@ -108,6 +135,8 @@ services:
       SITE_ID: site-a
       DEVICE_COUNT: ${DEVICE_COUNT:-200}
       SEND_INTERVAL: ${SEND_INTERVAL:-5s}
+      BUNDLE_INTERVAL: ${BUNDLE_INTERVAL:-30m}
+      BUNDLE_TRACE_BYTES: ${BUNDLE_TRACE_BYTES:-2097152}
       LOG_LEVEL: ${AGENT_LOG_LEVEL:-info}
     ports:
       - "9102:9102"
@@ -149,3 +178,4 @@ services:
 
 volumes:
   pg-data:
+  minio-data:

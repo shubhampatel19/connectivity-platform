@@ -5,7 +5,7 @@ SERVICES  := connectivity-edge-agent connectivity-ingest-api connectivity-teleme
 MODULES   := connectivity-contracts connectivity-go-kit $(SERVICES)
 COMPOSE   := docker compose
 
-.PHONY: bootstrap tidy test up down ps logs stop start kill psql lag topics
+.PHONY: bootstrap tidy test up down ps logs stop start kill psql bundles lag topics
 
 bootstrap: ## clone or update every component repo and create go.work
 	./scripts/bootstrap.sh
@@ -39,6 +39,9 @@ kill: ## make kill s=telemetry-processor   (SIGKILL, no graceful shutdown)
 
 psql:
 	$(COMPOSE) exec postgres psql -U connectivity -d connectivity
+
+bundles: ## latest log bundles indexed
+	$(COMPOSE) exec postgres psql -U connectivity -d connectivity -c "SELECT device_id, reason, size_bytes, collected_at, indexed_at - collected_at AS delay FROM log_bundles ORDER BY collected_at DESC LIMIT 15"
 
 lag: ## consumer group offsets and lag per partition
 	$(COMPOSE) exec kafka /opt/kafka/bin/kafka-consumer-groups.sh --bootstrap-server localhost:9092 --describe --group telemetry-processor

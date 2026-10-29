@@ -56,3 +56,37 @@ groups:
         labels: { severity: page }
         annotations:
           summary: "{{ $labels.job }} is not being scraped."
+
+      - alert: ObjectStoreErrors
+        expr: sum(rate(connectivity_ingest_object_store_errors_total[2m])) > 0
+        for: 2m
+        labels: { severity: page }
+        annotations:
+          summary: The ingest API is failing to read or write the object store; log bundle uploads are stalled.
+
+      - alert: BundleUploadsFailing
+        expr: sum(rate(connectivity_agent_bundle_upload_failures_total[5m])) > 0.1
+        for: 5m
+        labels: { severity: ticket }
+        annotations:
+          summary: Devices keep failing to upload log bundles and are holding them in their spools.
+
+      - alert: BundleSpoolBacklog
+        expr: sum(connectivity_agent_spool_bundles) > 50
+        for: 10m
+        labels: { severity: ticket }
+        annotations:
+          summary: More than 50 log bundles are waiting at the edge.
+
+      - alert: BundlesEvicted
+        expr: sum(increase(connectivity_agent_bundle_uploads_total{result="evicted"}[10m])) > 0
+        labels: { severity: page }
+        annotations:
+          summary: Edge spools are full and evicting log bundles. Support data is being lost.
+
+      - alert: BundleChecksumFailures
+        expr: sum(increase(connectivity_ingest_bundle_assembly_failures_total{reason="checksum"}[10m])) > 0
+        labels: { severity: ticket }
+        annotations:
+          summary: Assembled bundles don't match the checksum their device declared.
+
