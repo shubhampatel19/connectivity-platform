@@ -71,7 +71,7 @@ jobs:
           [ "$(q 'SELECT (SELECT coalesce(sum(sample_count),0) FROM ingested_batches) = (SELECT count(*) FROM telemetry)')" = t ] \
             || { echo "::error::sample count does not match batch markers"; exit 1; }
 
-      - name: Wait for a log bundle in Postgres and MinIO
+      - name: Wait for a log bundle in Postgres and the object store
         working-directory: connectivity-platform
         run: |
           q() { docker compose exec -T postgres psql -U connectivity -d connectivity -tAc "$1" 2>/dev/null || echo 0; }
@@ -82,10 +82,10 @@ jobs:
           [ "$(q 'SELECT count(*) FROM log_bundles')" -gt 0 ] || { echo "::error::no log bundle was indexed within 5 minutes"; exit 1; }
           read -r key size <<<"$(q "SELECT object_key || ' ' || size_bytes FROM log_bundles ORDER BY indexed_at LIMIT 1")"
           echo "bundles indexed: $(q 'SELECT count(*) FROM log_bundles'); checking $key ($size bytes)"
-          docker compose exec -T minio mc alias set local http://localhost:9000 connectivity connectivity-secret > /dev/null
-          stored=$(docker compose exec -T minio mc stat --json "local/log-bundles/$key" | python3 -c 'import json,sys; print(json.load(sys.stdin)["size"])')
-          [ "$stored" = "$size" ] || { echo "::error::$key is $stored bytes in MinIO but the index says $size"; exit 1; }
-          echo "object in MinIO matches the index"
+          # S3 buckets live under /buckets in the SeaweedFS filer.
+          stored=$(docker compose exec -T object-store curl -sI "http://localhost:8888/buckets/log-bundles/$key" | awk 'tolower($1) == "content-length:" {print $2}' | tr -d '\r')
+          [ "$stored" = "$size" ] || { echo "::error::$key is '$stored' bytes in the object store but the index says $size"; exit 1; }
+          echo "object in the object store matches the index"
 
       - name: Check every Prometheus target is up
         run: |

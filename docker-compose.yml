@@ -1,6 +1,6 @@
 # Connectivity: edge agents -> ingest API -> Kafka -> telemetry processor ->
-# Postgres, with log bundles stored in MinIO, and Prometheus and Grafana
-# watching all of it.
+# Postgres, with log bundles in an S3-compatible object store (SeaweedFS),
+# and Prometheus and Grafana watching all of it.
 #
 # Service images build from sibling clones of each component repo. Run
 # scripts/bootstrap.sh once to set up that layout.
@@ -70,24 +70,23 @@ services:
       retries: 20
     restart: unless-stopped
 
-  # Object storage for log bundles (S3 API on 9000, web console on 9001).
-  minio:
-    image: minio/minio:RELEASE.2025-04-22T22-12-26Z
-    command: ["server", "/data", "--console-address", ":9001"]
-    environment:
-      MINIO_ROOT_USER: ${S3_ACCESS_KEY:-connectivity}
-      MINIO_ROOT_PASSWORD: ${S3_SECRET_KEY:-connectivity-secret}
-      MINIO_PROMETHEUS_AUTH_TYPE: public
+  # Object storage for log bundles: SeaweedFS with its S3 gateway.
+  # S3 API on 8333; the filer on 8888 lets you browse stored bundles.
+  # Credentials live in seaweedfs/s3.json and must match S3_ACCESS_KEY/S3_SECRET_KEY.
+  object-store:
+    image: chrislusf/seaweedfs:4.47
+    command: ["server", "-dir=/data", "-s3", "-s3.port=8333", "-s3.config=/etc/seaweedfs/s3.json", "-metricsPort=9324"]
     ports:
-      - "9000:9000"
-      - "9001:9001"
+      - "8333:8333"
+      - "8888:8888"
     volumes:
-      - minio-data:/data
+      - object-data:/data
+      - ./seaweedfs/s3.json:/etc/seaweedfs/s3.json:ro
     healthcheck:
-      test: ["CMD", "mc", "ready", "local"]
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://localhost:9333/cluster/status || exit 1"]
       interval: 5s
       timeout: 5s
-      retries: 20
+      retries: 30
     restart: unless-stopped
 
   # ---------- cloud: services ----------
@@ -98,7 +97,7 @@ services:
       KAFKA_BROKERS: kafka:9092
       TOKEN_SECRET: ${TOKEN_SECRET:-dev-token-secret-change-me}
       ENROLLMENT_KEY: ${ENROLLMENT_KEY:-dev-enrollment-key}
-      S3_ENDPOINT: minio:9000
+      S3_ENDPOINT: object-store:8333
       S3_ACCESS_KEY: ${S3_ACCESS_KEY:-connectivity}
       S3_SECRET_KEY: ${S3_SECRET_KEY:-connectivity-secret}
       S3_BUCKET: log-bundles
@@ -107,8 +106,8 @@ services:
       - "8080:8080"
     depends_on:
       kafka-init: { condition: service_completed_successfully }
-      # Started, not healthy: telemetry must flow even while MinIO is down.
-      minio: { condition: service_started }
+      # Started, not healthy: telemetry must flow even while the object store is down.
+      object-store: { condition: service_started }
     restart: unless-stopped
 
   telemetry-processor:
@@ -178,4 +177,4 @@ services:
 
 volumes:
   pg-data:
-  minio-data:
+  object-data:

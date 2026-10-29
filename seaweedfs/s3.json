@@ -1,0 +1,11 @@
+{
+  "identities": [
+    {
+      "name": "connectivity",
+      "credentials": [
+        { "accessKey": "connectivity", "secretKey": "connectivity-secret" }
+      ],
+      "actions": ["Admin", "Read", "List", "Tagging", "Write"]
+    }
+  ]
+}
