@@ -101,7 +101,7 @@ Telemetry should be completely unaffected, and `/readyz` should stay 200, which 
 - **4xx is permanent, 5xx is transient.** The agent drops a batch the backend rejects with 4xx, so one bad batch can't wedge its queue. It retries 5xx responses, timeouts and 429s.
 - **The fleet is de-synchronized.** Devices start at random offsets and back off with jitter, so recovery from an outage doesn't stampede.
 - **Log uploads resume, and the cloud keeps no session state in memory.** Upload sessions live in the object store, chunks are checksummed one by one, and the assembled bundle is verified against the device's declared SHA-256 before anything is published.
-- **Log bundles can't hurt telemetry.** They use a separate, capped worker pool at the edge, and the ingest API's readiness doesn't depend on MinIO.
+- **Log bundles can't hurt telemetry.** They use a separate, capped worker pool at the edge, and the ingest API's readiness doesn't depend on the object store.
 - **The object store is swappable.** The ingest API speaks plain S3. The stack started on MinIO; when MinIO withdrew its community images from Docker Hub and Quay, builds broke overnight, and moving to SeaweedFS was a change to one compose service. Pin versions, and know which of your dependencies can disappear.
 - **Liveness and readiness are separate.** `/healthz` stays up when Kafka is down, while `/readyz` reports it. Restarting the process wouldn't fix a dependency outage.
 
