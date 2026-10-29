@@ -1,0 +1,109 @@
+# Unit tests for the alert rules: `promtool test rules prometheus/alerts_test.yml`.
+# CI runs them, so a threshold or label change that breaks an alert fails the build.
+rule_files: [alerts.yml]
+evaluation_interval: 30s
+tests:
+  # Outage: queue grows, nothing forwarded, nothing reaches the cloud.
+  - interval: 30s
+    input_series:
+      - series: 'connectivity_gateway_queue_records{job="site-gateway",site="site-b"}'
+        values: '0+600x20'
+      - series: 'connectivity_gateway_forwarded_total{job="site-gateway",site="site-b"}'
+        values: '0x20'
+      - series: 'connectivity_gateway_upstream_requests_total{job="site-gateway",site="site-b",route="heartbeat",outcome="ok"}'
+        values: '0x20'
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: GatewayBacklog
+        exp_alerts:
+          - exp_labels: { severity: ticket, site: site-b }
+            exp_annotations:
+              summary: "The site-b gateway is holding 7200 batches the cloud hasn't accepted."
+              description: Normal during a cloud outage. If the cloud is up, check the upstream outcome panel and forward failures.
+      - eval_time: 10m
+        alertname: GatewayBacklogNotDraining
+        exp_alerts: []
+  # Cloud is back (heartbeats ok) but the forwarder never moves.
+  - interval: 30s
+    input_series:
+      - series: 'connectivity_gateway_queue_records{job="site-gateway",site="site-b"}'
+        values: '500x30'
+      - series: 'connectivity_gateway_forwarded_total{job="site-gateway",site="site-b"}'
+        values: '0x30'
+      - series: 'connectivity_gateway_upstream_requests_total{job="site-gateway",site="site-b",route="heartbeat",outcome="ok"}'
+        values: '0+20x30'
+    alert_rule_test:
+      - eval_time: 12m
+        alertname: GatewayBacklogNotDraining
+        exp_alerts:
+          - exp_labels: { severity: page, site: site-b }
+            exp_annotations:
+              summary: "The site-b gateway reaches the cloud but isn't draining its queue."
+              description: Pass-through calls succeed while nothing is forwarded, so the forwarder itself is stuck.
+  # Evictions, saturation, heap, GC, offline devices.
+  - interval: 30s
+    input_series:
+      - series: 'connectivity_gateway_queue_dropped_total{job="site-gateway",site="site-b",reason="evicted"}'
+        values: '0 0 5 10 15'
+      - series: 'connectivity_gateway_http_threads_active{job="site-gateway",site="site-b"}'
+        values: '32x20'
+      - series: 'connectivity_gateway_http_threads_max{job="site-gateway",site="site-b"}'
+        values: '32x20'
+      - series: 'connectivity_gateway_http_rejected_total{job="site-gateway",site="site-b"}'
+        values: '0x20'
+      - series: 'jvm_memory_used_bytes{job="site-gateway",site="site-b",area="heap"}'
+        values: '240000000x20'
+      - series: 'jvm_memory_max_bytes{job="site-gateway",site="site-b",area="heap"}'
+        values: '268435456x20'
+      - series: 'jvm_gc_collection_seconds_sum{job="site-gateway",site="site-b",gc="G1 Young Generation"}'
+        values: '0+6x20'
+      - series: 'connectivity_gateway_devices{job="site-gateway",site="site-b",status="online"}'
+        values: '80x20'
+      - series: 'connectivity_gateway_devices{job="site-gateway",site="site-b",status="offline"}'
+        values: '20x20'
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: GatewayDroppingData
+        exp_alerts:
+          - exp_labels: { severity: page, site: site-b, reason: evicted }
+            exp_annotations:
+              summary: "The site-b gateway discarded queued telemetry (reason: evicted). This is data loss."
+      - eval_time: 3m
+        alertname: GatewayHttpSaturated
+        exp_alerts:
+          - exp_labels: { severity: page, site: site-b }
+            exp_annotations:
+              summary: "The site-b gateway's HTTP workers are saturated; devices are being turned away."
+              description: Usually a slow (not down) cloud holding workers on pass-through calls. Compare with upstream latency.
+      - eval_time: 6m
+        alertname: GatewayHeapPressure
+        exp_alerts:
+          - exp_labels: { severity: ticket, site: site-b }
+            exp_annotations:
+              summary: "The site-b gateway's heap is over 85% of -Xmx for 5 minutes."
+      - eval_time: 8m
+        alertname: GatewayGcTimeHigh
+        exp_alerts:
+          - exp_labels: { severity: ticket, site: site-b }
+            exp_annotations:
+              summary: "The site-b gateway spends more than 10% of its time in garbage collection."
+      - eval_time: 6m
+        alertname: GatewayDevicesOffline
+        exp_alerts:
+          - exp_labels: { severity: ticket, site: site-b }
+            exp_annotations:
+              summary: "More than 10% of the devices the site-b gateway knows about have gone silent."
+  # Per-site agent alerts: only site A is failing.
+  - interval: 30s
+    input_series:
+      - series: 'connectivity_agent_send_failures_total{job="edge-agent",site="site-a"}'
+        values: '0+60x10'
+      - series: 'connectivity_agent_send_failures_total{job="edge-agent",site="site-b"}'
+        values: '0x10'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: AgentSendFailures
+        exp_alerts:
+          - exp_labels: { severity: page, site: site-a }
+            exp_annotations:
+              summary: "Devices at site-a are failing to deliver telemetry and are buffering locally."

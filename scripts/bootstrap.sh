@@ -10,22 +10,26 @@
 #   ├── connectivity-go-kit/
 #   ├── connectivity-edge-agent/
 #   ├── connectivity-ingest-api/
-#   └── connectivity-telemetry-processor/
+#   ├── connectivity-telemetry-processor/
+#   └── connectivity-site-gateway/       (Java, not part of go.work)
 set -euo pipefail
 
 OWNER="${OWNER:-spr732}"
-REPOS=(
+GO_REPOS=(
   connectivity-contracts
   connectivity-go-kit
   connectivity-edge-agent
   connectivity-ingest-api
   connectivity-telemetry-processor
 )
+OTHER_REPOS=(
+  connectivity-site-gateway
+)
 
 WORKSPACE="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$WORKSPACE"
 
-for repo in "${REPOS[@]}"; do
+for repo in "${GO_REPOS[@]}" "${OTHER_REPOS[@]}"; do
   if [[ -d "$repo/.git" ]]; then
     echo "updating $repo"
     git -C "$repo" pull --ff-only --quiet
@@ -36,7 +40,7 @@ for repo in "${REPOS[@]}"; do
 done
 
 if [[ ! -f go.work ]]; then
-  go work init "${REPOS[@]/#/./}"
+  go work init "${GO_REPOS[@]/#/./}"
   echo "created go.work"
 fi
 

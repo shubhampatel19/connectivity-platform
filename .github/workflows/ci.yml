@@ -18,17 +18,24 @@ jobs:
           docker run --rm -v "$PWD/prometheus:/etc/prometheus:ro" \
             --entrypoint promtool prom/prometheus:v2.53.0 \
             check config /etc/prometheus/prometheus.yml
+      - name: Alert rule unit tests
+        run: |
+          docker run --rm -v "$PWD/prometheus:/etc/prometheus:ro" \
+            --entrypoint promtool prom/prometheus:v2.53.0 \
+            test rules /etc/prometheus/alerts_test.yml
       - name: Grafana dashboard JSON
         run: python3 -m json.tool grafana/provisioning/dashboards/connectivity-overview.json > /dev/null
 
   # Runs the whole stack the way `make up` does and checks that telemetry from
-  # simulated devices actually lands in Postgres.
+  # simulated devices actually lands in Postgres, from both sites, including
+  # site B's data that the gateway held through a cloud outage.
   smoke:
     needs: lint
     runs-on: ubuntu-latest
     timeout-minutes: 20
     env:
       DEVICE_COUNT: "50"
+      SITE_B_DEVICE_COUNT: "30"
       SEND_INTERVAL: 2s
       BUNDLE_INTERVAL: 20s
       BUNDLE_TRACE_BYTES: "262144"
@@ -39,7 +46,7 @@ jobs:
 
       - name: Clone component repos
         run: |
-          for repo in connectivity-edge-agent connectivity-ingest-api connectivity-telemetry-processor; do
+          for repo in connectivity-edge-agent connectivity-ingest-api connectivity-telemetry-processor connectivity-site-gateway; do
             git clone --depth 1 "https://github.com/${{ github.repository_owner }}/$repo.git"
           done
 
@@ -87,10 +94,60 @@ jobs:
           [ "$stored" = "$size" ] || { echo "::error::$key is '$stored' bytes in the object store but the index says $size"; exit 1; }
           echo "object in the object store matches the index"
 
+      - name: "Store-and-forward: site B through a cloud outage"
+        working-directory: connectivity-platform
+        run: |
+          q()  { docker compose exec -T postgres psql -U connectivity -d connectivity -tAc "$1" 2>/dev/null || echo 0; }
+          gm() { curl -s localhost:8090/metrics | awk -v m="$1" 'index($1, m) == 1 && (length($1) == length(m) || substr($1, length(m) + 1, 1) == "{") {t += $2} END {printf "%d\n", t}'; }
+          site_b_batches() { q "SELECT count(*) FROM ingested_batches b JOIN devices d USING (device_id) WHERE d.site_id = 'site-b'"; }
+
+          # 1. Site B's devices reach the cloud through the gateway.
+          for _ in $(seq 1 36); do [ "$(site_b_batches)" -gt 0 ] && break; sleep 5; done
+          [ "$(site_b_batches)" -gt 0 ] || { echo "::error::no site B telemetry reached Postgres through the gateway"; exit 1; }
+          inv=$(curl -s localhost:8090/gateway/v1/devices | python3 -c 'import json,sys; d=json.load(sys.stdin)["devices"]; print(sum(x["status"] == "online" for x in d))')
+          echo "site B: $(site_b_batches) batches stored, $inv devices online in the gateway inventory"
+          [ "$inv" -gt 0 ] || { echo "::error::the gateway inventory has no online devices"; exit 1; }
+          [ "$(gm connectivity_gateway_queue_records)" -eq 0 ] || { echo "::error::the gateway has a backlog while the cloud is healthy"; exit 1; }
+          queued0=$(gm connectivity_gateway_queued_total); fwd0=$(gm connectivity_gateway_forwarded_total)
+
+          # 2. Cloud outage: the gateway keeps acking site B and queues to disk.
+          t0=$(date +%s)
+          docker compose stop ingest-api
+          sleep 45
+          backlog=$(gm connectivity_gateway_queue_records)
+          echo "after 45s of outage the gateway holds $backlog batches"
+          [ "$backlog" -gt 0 ] || { echo "::error::the gateway did not queue anything during the outage"; exit 1; }
+          curl -fsS -o /dev/null localhost:8090/readyz || { echo "::error::gateway readiness followed the cloud down"; exit 1; }
+
+          # 3. Recovery: the queue drains completely, nothing is dropped.
+          docker compose start ingest-api
+          t1=$(date +%s)
+          for _ in $(seq 1 36); do [ "$(gm connectivity_gateway_queue_records)" -eq 0 ] && break; sleep 5; done
+          [ "$(gm connectivity_gateway_queue_records)" -eq 0 ] || { echo "::error::the gateway queue did not drain within 3 minutes of recovery"; exit 1; }
+          queued=$(( $(gm connectivity_gateway_queued_total) - queued0 )); forwarded=$(( $(gm connectivity_gateway_forwarded_total) - fwd0 ))
+          dropped=$(gm connectivity_gateway_queue_dropped_total)
+          echo "outage: $queued batches queued, $forwarded forwarded, $dropped dropped"
+          [ "$dropped" -eq 0 ] || { echo "::error::the gateway dropped $dropped batches"; exit 1; }
+          [ "$queued" -eq "$forwarded" ] || { echo "::error::queued $queued batches but forwarded $forwarded"; exit 1; }
+
+          # 4. Nothing site B sampled during the outage is missing from Postgres:
+          #    every device has data across the whole window, with no gap longer
+          #    than a few send intervals. A lost queue would leave a hole the
+          #    length of the outage in every device's series.
+          window="t.ts BETWEEN to_timestamp($t0) AND to_timestamp($t1)"
+          gaps() { q "SELECT count(*) FROM (SELECT ts - lag(ts) OVER (PARTITION BY device_id, metric ORDER BY ts) AS gap FROM telemetry t JOIN devices d USING (device_id) WHERE d.site_id = 'site-b' AND $window) g WHERE gap > interval '10 seconds'"; }
+          covered() { q "SELECT count(DISTINCT device_id) FROM telemetry t JOIN devices d USING (device_id) WHERE d.site_id = 'site-b' AND $window AND t.ts > to_timestamp($t1 - 10)"; }
+          for _ in $(seq 1 24); do [ "$(gaps)" -eq 0 ] && [ "$(covered)" -ge "$SITE_B_DEVICE_COUNT" ] && break; sleep 5; done
+          echo "site B devices with data through the end of the outage: $(covered) of $SITE_B_DEVICE_COUNT; gaps over 10s: $(gaps)"
+          [ "$(covered)" -ge "$SITE_B_DEVICE_COUNT" ] || { echo "::error::some site B devices have no data for the end of the outage"; exit 1; }
+          [ "$(gaps)" -eq 0 ] || { echo "::error::site B telemetry has gaps over the outage window; queued data was lost"; exit 1; }
+          [ "$(q 'SELECT (SELECT coalesce(sum(sample_count),0) FROM ingested_batches) = (SELECT count(*) FROM telemetry)')" = t ] \
+            || { echo "::error::sample count does not match batch markers after the outage"; exit 1; }
+
       - name: Check every Prometheus target is up
         run: |
           for _ in $(seq 1 24); do
-            if curl -s localhost:9090/api/v1/targets | python3 -c 'import json,sys; t=json.load(sys.stdin)["data"]["activeTargets"]; h={x["labels"]["job"]: x["health"] for x in t}; print(h); sys.exit(0 if h and all(v == "up" for v in h.values()) else 1)'; then
+            if curl -s localhost:9090/api/v1/targets | python3 -c 'import json,sys; t=json.load(sys.stdin)["data"]["activeTargets"]; h={x["labels"]["job"] + "/" + x["labels"]["instance"]: x["health"] for x in t}; print(h); sys.exit(0 if h and all(v == "up" for v in h.values()) else 1)'; then
               exit 0
             fi
             sleep 5

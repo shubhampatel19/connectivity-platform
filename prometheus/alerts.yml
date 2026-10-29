@@ -1,6 +1,7 @@
 # Alerts are the entry point of every drill: something fires, you start from
-# the dashboard, and work inward. Thresholds are tuned for the default
-# 200-device fleet; adjust if you change DEVICE_COUNT.
+# the dashboard, and work inward. Thresholds are tuned for the default fleet
+# (200 devices at site A, 100 behind the site B gateway); adjust if you
+# change DEVICE_COUNT or SITE_B_DEVICE_COUNT.
 groups:
   - name: connectivity
     rules:
@@ -14,18 +15,18 @@ groups:
           summary: More than 5% of ingestion requests are failing with 5xx.
 
       - alert: AgentSendFailures
-        expr: sum(rate(connectivity_agent_send_failures_total[2m])) > 0.5
+        expr: sum by (site) (rate(connectivity_agent_send_failures_total[2m])) > 0.5
         for: 2m
         labels: { severity: page }
         annotations:
-          summary: Devices are failing to deliver telemetry and are buffering locally.
+          summary: "Devices at {{ $labels.site }} are failing to deliver telemetry and are buffering locally."
 
       - alert: AgentDroppingSamples
-        expr: sum(rate(connectivity_agent_samples_dropped_total[5m])) > 0
+        expr: sum by (site) (rate(connectivity_agent_samples_dropped_total[5m])) > 0
         for: 1m
         labels: { severity: page }
         annotations:
-          summary: Device buffers are full and overwriting data. This is data loss.
+          summary: "Device buffers at {{ $labels.site }} are full and overwriting data. This is data loss."
 
       - alert: ConsumerLagHigh
         expr: sum(kafka_consumergroup_lag{consumergroup="telemetry-processor"}) > 2000
@@ -90,3 +91,66 @@ groups:
         annotations:
           summary: Assembled bundles don't match the checksum their device declared.
 
+  # The site gateway holds data the cloud hasn't seen yet, so its own health
+  # is part of the data path. These read only the gateway's metrics.
+  - name: site-gateway
+    rules:
+      - alert: GatewayBacklog
+        expr: max by (site) (connectivity_gateway_queue_records) > 1000
+        for: 3m
+        labels: { severity: ticket }
+        annotations:
+          summary: "The {{ $labels.site }} gateway is holding {{ $value }} batches the cloud hasn't accepted."
+          description: Normal during a cloud outage. If the cloud is up, check the upstream outcome panel and forward failures.
+
+      - alert: GatewayBacklogNotDraining
+        expr: |
+          max by (site) (connectivity_gateway_queue_records) > 0
+            and on (site) sum by (site) (rate(connectivity_gateway_forwarded_total[5m])) == 0
+            and on (site) sum by (site) (rate(connectivity_gateway_upstream_requests_total{outcome="ok"}[5m])) > 0
+        for: 5m
+        labels: { severity: page }
+        annotations:
+          summary: "The {{ $labels.site }} gateway reaches the cloud but isn't draining its queue."
+          description: Pass-through calls succeed while nothing is forwarded, so the forwarder itself is stuck.
+
+      - alert: GatewayDroppingData
+        expr: sum by (site, reason) (increase(connectivity_gateway_queue_dropped_total[10m])) > 0
+        labels: { severity: page }
+        annotations:
+          summary: "The {{ $labels.site }} gateway discarded queued telemetry (reason: {{ $labels.reason }}). This is data loss."
+
+      - alert: GatewayHttpSaturated
+        expr: |
+          max by (site) (connectivity_gateway_http_threads_active / connectivity_gateway_http_threads_max) > 0.9
+            or sum by (site) (rate(connectivity_gateway_http_rejected_total[2m])) > 0
+        for: 2m
+        labels: { severity: page }
+        annotations:
+          summary: "The {{ $labels.site }} gateway's HTTP workers are saturated; devices are being turned away."
+          description: Usually a slow (not down) cloud holding workers on pass-through calls. Compare with upstream latency.
+
+      - alert: GatewayHeapPressure
+        expr: |
+          max by (site) (jvm_memory_used_bytes{job="site-gateway", area="heap"}
+            / (jvm_memory_max_bytes{job="site-gateway", area="heap"} > 0)) > 0.85
+        for: 5m
+        labels: { severity: ticket }
+        annotations:
+          summary: "The {{ $labels.site }} gateway's heap is over 85% of -Xmx for 5 minutes."
+
+      - alert: GatewayGcTimeHigh
+        expr: sum by (site) (rate(jvm_gc_collection_seconds_sum{job="site-gateway"}[2m])) > 0.1
+        for: 5m
+        labels: { severity: ticket }
+        annotations:
+          summary: "The {{ $labels.site }} gateway spends more than 10% of its time in garbage collection."
+
+      - alert: GatewayDevicesOffline
+        expr: |
+          sum by (site) (connectivity_gateway_devices{status="offline"})
+            / clamp_min(sum by (site) (connectivity_gateway_devices), 1) > 0.1
+        for: 5m
+        labels: { severity: ticket }
+        annotations:
+          summary: "More than 10% of the devices the {{ $labels.site }} gateway knows about have gone silent."

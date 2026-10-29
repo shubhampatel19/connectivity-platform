@@ -2,6 +2,9 @@
 # Postgres, with log bundles in an S3-compatible object store (SeaweedFS),
 # and Prometheus and Grafana watching all of it.
 #
+# Two edge sites: site A's devices talk to the cloud directly; site B's
+# devices talk to an on-site gateway (Java) that stores and forwards.
+#
 # Service images build from sibling clones of each component repo. Run
 # scripts/bootstrap.sh once to set up that layout.
 name: connectivity
@@ -124,7 +127,7 @@ services:
       postgres: { condition: service_healthy }
     restart: unless-stopped
 
-  # ---------- edge ----------
+  # ---------- edge: site A, devices talk to the cloud directly ----------
   edge-agent:
     build: ../connectivity-edge-agent
     image: connectivity/edge-agent:dev
@@ -141,6 +144,44 @@ services:
       - "9102:9102"
     depends_on:
       - ingest-api
+    restart: unless-stopped
+
+  # ---------- edge: site B, devices talk to the cloud through a gateway ----------
+  # The gateway serves the same /v1 API as the cloud, so the only difference
+  # for site B's devices is INGEST_URL. Its queue and inventory live in the
+  # gateway-data volume and survive restarts.
+  site-gateway:
+    build: ../connectivity-site-gateway
+    image: connectivity/site-gateway:dev
+    environment:
+      UPSTREAM_URL: http://ingest-api:8080
+      GATEWAY_ID: site-b-gateway
+      JAVA_OPTS: ${GATEWAY_JAVA_OPTS:--Xms64m -Xmx256m -XX:+UseG1GC -XX:+ExitOnOutOfMemoryError}
+      LOG_LEVEL: ${GATEWAY_LOG_LEVEL:-info}
+    ports:
+      - "8090:8090"
+    volumes:
+      - gateway-data:/var/lib/connectivity-gateway
+    depends_on:
+      - ingest-api
+    restart: unless-stopped
+
+  edge-agent-site-b:
+    build: ../connectivity-edge-agent
+    image: connectivity/edge-agent:dev
+    environment:
+      INGEST_URL: http://site-gateway:8090
+      ENROLLMENT_KEY: ${ENROLLMENT_KEY:-dev-enrollment-key}
+      SITE_ID: site-b
+      DEVICE_COUNT: ${SITE_B_DEVICE_COUNT:-100}
+      SEND_INTERVAL: ${SEND_INTERVAL:-5s}
+      BUNDLE_INTERVAL: ${BUNDLE_INTERVAL:-30m}
+      BUNDLE_TRACE_BYTES: ${BUNDLE_TRACE_BYTES:-2097152}
+      LOG_LEVEL: ${AGENT_LOG_LEVEL:-info}
+    ports:
+      - "9103:9102"
+    depends_on:
+      - site-gateway
     restart: unless-stopped
 
   # ---------- observability ----------
@@ -178,3 +219,4 @@ services:
 volumes:
   pg-data:
   object-data:
+  gateway-data:

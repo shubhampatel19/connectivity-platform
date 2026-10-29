@@ -6,7 +6,7 @@
   ],
   "timezone": "browser",
   "schemaVersion": 39,
-  "version": 2,
+  "version": 3,
   "refresh": "5s",
   "time": {
     "from": "now-30m",
@@ -49,8 +49,8 @@
             "type": "prometheus",
             "uid": "prom"
           },
-          "expr": "sum by (reason) (rate(connectivity_agent_send_failures_total[1m]))",
-          "legendFormat": "{{reason}}"
+          "expr": "sum by (site, reason) (rate(connectivity_agent_send_failures_total[1m]))",
+          "legendFormat": "{{site}} {{reason}}"
         }
       ]
     },
@@ -90,8 +90,8 @@
             "type": "prometheus",
             "uid": "prom"
           },
-          "expr": "sum(connectivity_agent_buffered_samples)",
-          "legendFormat": "buffered"
+          "expr": "sum by (site) (connectivity_agent_buffered_samples)",
+          "legendFormat": "{{site}} buffered"
         },
         {
           "refId": "B",
@@ -99,8 +99,8 @@
             "type": "prometheus",
             "uid": "prom"
           },
-          "expr": "sum(rate(connectivity_agent_samples_dropped_total[1m]))",
-          "legendFormat": "dropped/s"
+          "expr": "sum by (site) (rate(connectivity_agent_samples_dropped_total[1m]))",
+          "legendFormat": "{{site}} dropped/s"
         }
       ]
     },
@@ -140,8 +140,8 @@
             "type": "prometheus",
             "uid": "prom"
           },
-          "expr": "histogram_quantile(0.5, sum by (le) (rate(connectivity_agent_send_duration_seconds_bucket[1m])))",
-          "legendFormat": "p50"
+          "expr": "histogram_quantile(0.5, sum by (le, site) (rate(connectivity_agent_send_duration_seconds_bucket[1m])))",
+          "legendFormat": "{{site}} p50"
         },
         {
           "refId": "B",
@@ -149,8 +149,8 @@
             "type": "prometheus",
             "uid": "prom"
           },
-          "expr": "histogram_quantile(0.95, sum by (le) (rate(connectivity_agent_send_duration_seconds_bucket[1m])))",
-          "legendFormat": "p95"
+          "expr": "histogram_quantile(0.95, sum by (le, site) (rate(connectivity_agent_send_duration_seconds_bucket[1m])))",
+          "legendFormat": "{{site}} p95"
         }
       ]
     },
@@ -190,8 +190,8 @@
             "type": "prometheus",
             "uid": "prom"
           },
-          "expr": "sum(connectivity_agent_devices_with_pending_batch)",
-          "legendFormat": "pending"
+          "expr": "sum by (site) (connectivity_agent_devices_with_pending_batch)",
+          "legendFormat": "{{site}} pending"
         },
         {
           "refId": "B",
@@ -199,8 +199,8 @@
             "type": "prometheus",
             "uid": "prom"
           },
-          "expr": "sum(connectivity_agent_devices)",
-          "legendFormat": "total devices"
+          "expr": "sum by (site) (connectivity_agent_devices)",
+          "legendFormat": "{{site}} devices"
         }
       ]
     },
@@ -496,7 +496,7 @@
             "uid": "prom"
           },
           "expr": "go_goroutines{job=~\"edge-agent|ingest-api|telemetry-processor\"}",
-          "legendFormat": "{{job}}"
+          "legendFormat": "{{job}} {{site}}"
         }
       ]
     },
@@ -537,7 +537,7 @@
             "uid": "prom"
           },
           "expr": "process_resident_memory_bytes{job=~\"edge-agent|ingest-api|telemetry-processor\"}",
-          "legendFormat": "{{job}}"
+          "legendFormat": "{{job}} {{site}}"
         }
       ]
     },
@@ -829,6 +829,472 @@
           },
           "expr": "histogram_quantile(0.95, sum by (le) (rate(connectivity_agent_bundle_chunk_duration_seconds_bucket[5m])))",
           "legendFormat": "p95"
+        }
+      ]
+    },
+    {
+      "id": 100,
+      "type": "row",
+      "title": "Site gateway (site B)",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 72
+      },
+      "panels": []
+    },
+    {
+      "id": 19,
+      "type": "timeseries",
+      "title": "Site gateway: store-and-forward queue",
+      "description": "Batches on the gateway's disk that the cloud hasn't accepted. Zero while the cloud is healthy.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prom"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 73
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prom"
+          },
+          "expr": "connectivity_gateway_queue_records{job=\"site-gateway\"}",
+          "legendFormat": "batches queued"
+        }
+      ]
+    },
+    {
+      "id": 20,
+      "type": "timeseries",
+      "title": "Site gateway: queued, forwarded, dropped",
+      "description": "Batches per second into and out of the queue. Any drop is data loss.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prom"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 73
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prom"
+          },
+          "expr": "sum(rate(connectivity_gateway_queued_total{job=\"site-gateway\"}[1m]))",
+          "legendFormat": "queued/s"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prom"
+          },
+          "expr": "sum(rate(connectivity_gateway_forwarded_total{job=\"site-gateway\"}[1m]))",
+          "legendFormat": "forwarded/s"
+        },
+        {
+          "refId": "C",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prom"
+          },
+          "expr": "sum by (reason) (rate(connectivity_gateway_queue_dropped_total{job=\"site-gateway\"}[1m]))",
+          "legendFormat": "dropped/s {{reason}}"
+        }
+      ]
+    },
+    {
+      "id": 21,
+      "type": "timeseries",
+      "title": "Site gateway: cloud calls by outcome",
+      "description": "Every request the gateway makes to the cloud: pass-through and forwarded batches.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prom"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 81
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prom"
+          },
+          "expr": "sum by (outcome) (rate(connectivity_gateway_upstream_requests_total{job=\"site-gateway\"}[1m]))",
+          "legendFormat": "{{outcome}}"
+        }
+      ]
+    },
+    {
+      "id": 22,
+      "type": "timeseries",
+      "title": "Site gateway: time in queue p50 / p95",
+      "description": "How long delivered batches waited on the gateway. This is the extra delay site B's data carries after an outage.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prom"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 81
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prom"
+          },
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(connectivity_gateway_queue_wait_seconds_bucket{job=\"site-gateway\"}[5m])))",
+          "legendFormat": "p50"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prom"
+          },
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(connectivity_gateway_queue_wait_seconds_bucket{job=\"site-gateway\"}[5m])))",
+          "legendFormat": "p95"
+        }
+      ]
+    },
+    {
+      "id": 23,
+      "type": "timeseries",
+      "title": "Site gateway: HTTP workers and cloud slots",
+      "description": "Where requests wait. A slow cloud fills these; a down cloud doesn't.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prom"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 89
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prom"
+          },
+          "expr": "connectivity_gateway_http_threads_active{job=\"site-gateway\"}",
+          "legendFormat": "http workers busy"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prom"
+          },
+          "expr": "connectivity_gateway_http_threads_max{job=\"site-gateway\"}",
+          "legendFormat": "http workers max"
+        },
+        {
+          "refId": "C",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prom"
+          },
+          "expr": "connectivity_gateway_http_queue_depth{job=\"site-gateway\"}",
+          "legendFormat": "http waiting"
+        },
+        {
+          "refId": "D",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prom"
+          },
+          "expr": "connectivity_gateway_upstream_inflight{job=\"site-gateway\"}",
+          "legendFormat": "cloud calls in flight"
+        },
+        {
+          "refId": "E",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prom"
+          },
+          "expr": "connectivity_gateway_upstream_max_concurrency{job=\"site-gateway\"}",
+          "legendFormat": "cloud call cap"
+        },
+        {
+          "refId": "F",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prom"
+          },
+          "expr": "sum(rate(connectivity_gateway_http_rejected_total{job=\"site-gateway\"}[1m]))",
+          "legendFormat": "rejected/s"
+        }
+      ]
+    },
+    {
+      "id": 24,
+      "type": "timeseries",
+      "title": "Site gateway: site inventory",
+      "description": "Devices the gateway has heard from, by status. Inventory is saved to disk and survives restarts.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prom"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 89
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prom"
+          },
+          "expr": "connectivity_gateway_devices{job=\"site-gateway\"}",
+          "legendFormat": "{{status}}"
+        }
+      ]
+    },
+    {
+      "id": 25,
+      "type": "timeseries",
+      "title": "Site gateway: JVM heap",
+      "description": "Heap against -Xmx. A sawtooth is normal; a rising floor is not.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prom"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 97
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prom"
+          },
+          "expr": "jvm_memory_used_bytes{job=\"site-gateway\", area=\"heap\"}",
+          "legendFormat": "heap used"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prom"
+          },
+          "expr": "jvm_memory_committed_bytes{job=\"site-gateway\", area=\"heap\"}",
+          "legendFormat": "heap committed"
+        },
+        {
+          "refId": "C",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prom"
+          },
+          "expr": "jvm_memory_max_bytes{job=\"site-gateway\", area=\"heap\"}",
+          "legendFormat": "heap max (-Xmx)"
+        },
+        {
+          "refId": "D",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prom"
+          },
+          "expr": "jvm_memory_used_bytes{job=\"site-gateway\", area=\"nonheap\"}",
+          "legendFormat": "non-heap used"
+        }
+      ]
+    },
+    {
+      "id": 26,
+      "type": "timeseries",
+      "title": "Site gateway: GC time, threads, file descriptors",
+      "description": "GC seconds per second is the fraction of time spent collecting (0.1 = 10%).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prom"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 97
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prom"
+          },
+          "expr": "sum by (gc) (rate(jvm_gc_collection_seconds_sum{job=\"site-gateway\"}[1m]))",
+          "legendFormat": "GC s/s {{gc}}"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prom"
+          },
+          "expr": "jvm_threads_current{job=\"site-gateway\"}",
+          "legendFormat": "threads"
+        },
+        {
+          "refId": "C",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prom"
+          },
+          "expr": "process_open_fds{job=\"site-gateway\"}",
+          "legendFormat": "open fds"
         }
       ]
     }

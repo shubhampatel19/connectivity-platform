@@ -12,11 +12,20 @@ scrape_configs:
   - job_name: telemetry-processor
     static_configs:
       - targets: ["telemetry-processor:9101"]
+  # One job for both sites, so fleet-wide queries keep working; split by site.
   - job_name: edge-agent
     static_configs:
       - targets: ["edge-agent:9102"]
         labels:
           site: site-a
+      - targets: ["edge-agent-site-b:9102"]
+        labels:
+          site: site-b
+  - job_name: site-gateway
+    static_configs:
+      - targets: ["site-gateway:8090"]
+        labels:
+          site: site-b
   - job_name: kafka
     static_configs:
       - targets: ["kafka-exporter:9308"]
