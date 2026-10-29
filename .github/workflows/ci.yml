@@ -45,7 +45,14 @@ jobs:
 
       - name: Start the stack
         working-directory: connectivity-platform
-        run: docker compose up -d --build
+        run: |
+          if ! docker compose up -d --build > /tmp/compose-up.log 2>&1; then
+            cat /tmp/compose-up.log
+            # Annotations are readable through the API, unlike raw job logs.
+            echo "::error title=docker compose up failed::$(tail -n 25 /tmp/compose-up.log | sed -e ':a' -e 'N' -e '$!ba' -e 's/%/%25/g' -e 's/\r//g' -e 's/\n/%0A/g')"
+            exit 1
+          fi
+          cat /tmp/compose-up.log
 
       - name: Wait for telemetry in Postgres
         working-directory: connectivity-platform
@@ -100,6 +107,11 @@ jobs:
         run: |
           docker compose ps -a
           docker compose logs --no-color --tail=60
+          enc() { sed -e ':a' -e 'N' -e '$!ba' -e 's/%/%25/g' -e 's/\r//g' -e 's/\n/%0A/g'; }
+          echo "::error title=container states::$(docker compose ps -a --format '{{.Service}} {{.State}} {{.Status}}' | enc)"
+          for svc in $(docker compose ps -a --format '{{.Service}} {{.State}} {{.ExitCode}}' | awk '$2 != "running" && !($1 == "kafka-init" && $3 == 0) {print $1}'); do
+            echo "::error title=logs: $svc::$(docker compose logs --no-color --tail=20 "$svc" 2>&1 | enc)"
+          done
 
       - name: Tear down
         if: always()
