@@ -24,6 +24,10 @@ spec:
       terminationGracePeriodSeconds: 30
       securityContext:
         runAsNonRoot: true
+        # Distroless's "nonroot" user, by number: the kubelet can only verify
+        # runAsNonRoot against a numeric UID, not an image's user name.
+        runAsUser: 65532
+        runAsGroup: 65532
         seccompProfile: { type: RuntimeDefault }
       containers:
         - name: case-service
