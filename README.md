@@ -180,6 +180,8 @@ make chaos-stop                   # end everything now
 
 `make cluster-down` deletes the cluster and the edge with all their data.
 
+**If a pod dies with "too many open files"** on a Linux host, that's not a file descriptor limit. Every k3d node shares the host's kernel and its per-user inotify limits, and Ubuntu's default of 128 inotify instances runs out once Prometheus, Grafana, Loki, Alloy and Chaos Mesh are all watching files. Chaos Mesh's controller is usually the first to fail. `make cluster-up` warns when the limit is low; the fix is `sudo sysctl -w fs.inotify.max_user_instances=1024 fs.inotify.max_user_watches=524288`. CI hit exactly this.
+
 ## Warm-up drills
 
 These are known failures, run before the sealed bug drills, to learn what normal and broken look like on the dashboard. For each one, predict what you'll see before you trigger it, then check your prediction.

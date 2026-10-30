@@ -95,8 +95,21 @@ edge() {
     COMPOSE_PROFILES='' docker compose up -d --build
 }
 
+# On Linux every k3d node shares the host's kernel, and with it the per-user
+# inotify limits. Ubuntu's default of 128 instances runs out once this many
+# pods watch files, and the first pod to lose shows "too many open files".
+check_inotify() {
+  local f=/proc/sys/fs/inotify/max_user_instances
+  [ -r "$f" ] || return 0
+  if [ "$(cat "$f")" -lt 512 ]; then
+    echo "warning: fs.inotify.max_user_instances is $(cat "$f"); pods may fail with \"too many open files\"." >&2
+    echo "         raise it: sudo sysctl -w fs.inotify.max_user_instances=1024 fs.inotify.max_user_watches=524288" >&2
+  fi
+}
+
 up() {
   need docker k3d kubectl git
+  check_inotify
   if [ "$(cat .mode 2> /dev/null)" != cluster ] && [ -n "$(COMPOSE_PROFILES=cloud docker compose ps -q 2> /dev/null)" ]; then
     echo "compose mode is running and uses the same ports; run make down first" >&2
     exit 1
@@ -129,6 +142,7 @@ down() {
 
 chaos_install() {
   need helm kubectl
+  check_inotify
   helm repo add chaos-mesh https://charts.chaos-mesh.org --force-update > /dev/null
   # k3s runs its own containerd, at a socket path the chart can't guess.
   helm upgrade --install chaos-mesh chaos-mesh/chaos-mesh \
