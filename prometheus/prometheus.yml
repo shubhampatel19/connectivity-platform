@@ -29,6 +29,10 @@ scrape_configs:
       - targets: ["site-gateway:8090"]
         labels:
           site: site-b
+  # The WAN proxy: bytes through each site's link.
+  - job_name: wan
+    static_configs:
+      - targets: ["wan:8474"]
   - job_name: kafka
     static_configs:
       - targets: ["kafka-exporter:9308"]

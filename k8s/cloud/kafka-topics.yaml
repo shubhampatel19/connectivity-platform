@@ -1,0 +1,30 @@
+# Creates the topics, replicated across all three brokers. Safe to rerun:
+# `make deploy` deletes the finished Job and applies it again.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: kafka-topics
+spec:
+  backoffLimit: 20
+  template:
+    spec:
+      enableServiceLinks: false
+      restartPolicy: OnFailure
+      containers:
+        - name: topics
+          image: apache/kafka:3.8.0
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -euo pipefail
+              k=/opt/kafka/bin/kafka-topics.sh; b=kafka:9092
+              # Replication factor 3 fails until all three brokers have registered.
+              until [ "$(/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server $b 2>/dev/null | grep -c '^kafka-' || true)" -ge 3 ]; do
+                echo "waiting for 3 brokers"; sleep 5
+              done
+              for t in telemetry.raw:6 device.events:3 bundles.uploaded:3 device.alerts:3; do
+                $k --bootstrap-server $b --create --if-not-exists --topic "${t%:*}" --partitions "${t#*:}" --replication-factor 3
+              done
+              $k --bootstrap-server $b --describe
+          env:
+            - { name: KAFKA_HEAP_OPTS, value: "-Xmx128m" }

@@ -1,0 +1,17 @@
+# Two of three brokers unavailable for 3 minutes. Every partition drops
+# below min.insync.replicas, so every produce with acks=all fails: the
+# ingest API returns 503, devices and the gateway buffer, and nothing is
+# lost if the buffers hold. Predict which alerts fire, and in what order.
+apiVersion: chaos-mesh.org/v1alpha1
+kind: PodChaos
+metadata:
+  name: kafka-two-brokers-down
+  namespace: connectivity
+spec:
+  action: pod-failure
+  mode: fixed
+  value: "2"
+  duration: 3m
+  selector:
+    namespaces: [connectivity]
+    labelSelectors: { app: kafka }

@@ -1,0 +1,73 @@
+// Ships the logs of every pod in the namespace to Loki, read through the
+// Kubernetes API. Labels are kept few (app, pod, container, level); every
+// other field stays in the JSON line, where LogQL's | json can reach it.
+// trace_id goes in structured metadata, so Grafana can jump from a log line
+// to its trace without making trace IDs a label.
+
+discovery.kubernetes "pods" {
+	role = "pod"
+
+	namespaces {
+		names = ["connectivity"]
+	}
+}
+
+discovery.relabel "pods" {
+	targets = discovery.kubernetes.pods.targets
+
+	rule {
+		source_labels = ["__meta_kubernetes_namespace"]
+		target_label  = "namespace"
+	}
+
+	rule {
+		source_labels = ["__meta_kubernetes_pod_label_app"]
+		target_label  = "app"
+	}
+
+	rule {
+		source_labels = ["__meta_kubernetes_pod_name"]
+		target_label  = "pod"
+	}
+
+	rule {
+		source_labels = ["__meta_kubernetes_pod_container_name"]
+		target_label  = "container"
+	}
+}
+
+loki.source.kubernetes "pods" {
+	targets    = discovery.relabel.pods.output
+	forward_to = [loki.process.services.receiver]
+}
+
+loki.process "services" {
+	// Only the Go services log JSON through go-kit; Kafka, Postgres and the
+	// rest pass through untouched.
+	stage.match {
+		selector = "{app=~\"ingest-api|telemetry-processor|case-service\"}"
+
+		stage.json {
+			expressions = {
+				level    = "level",
+				trace_id = "trace_id",
+			}
+		}
+
+		stage.labels {
+			values = {level = ""}
+		}
+
+		stage.structured_metadata {
+			values = {trace_id = ""}
+		}
+	}
+
+	forward_to = [loki.write.default.receiver]
+}
+
+loki.write "default" {
+	endpoint {
+		url = "http://loki:3100/loki/api/v1/push"
+	}
+}

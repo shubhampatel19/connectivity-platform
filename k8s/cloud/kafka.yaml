@@ -1,0 +1,128 @@
+# Three Kafka brokers in KRaft combined mode (each is also a controller), so
+# the cluster survives losing one broker and the drills can take one, then
+# two, away. Topics are replicated 3 ways with min.insync.replicas=2: with
+# acks=all, one broker down is invisible to producers; two down and every
+# produce fails with NOT_ENOUGH_REPLICAS.
+#
+# Each pod derives its node ID from its ordinal (kafka-0 -> 0) and advertises
+# its stable DNS name from the headless service. Data lives on a node-local
+# volume, so a broker can only come back on the node it was on.
+apiVersion: v1
+kind: Service
+metadata:
+  name: kafka-headless
+  labels: { app: kafka }
+spec:
+  clusterIP: None
+  # Brokers must find each other before any is ready, or the controller
+  # quorum can never form.
+  publishNotReadyAddresses: true
+  selector: { app: kafka }
+  ports:
+    - { name: broker, port: 9092 }
+    - { name: controller, port: 9093 }
+---
+# Bootstrap address for clients. After the first metadata request they talk
+# to each broker by its own name.
+apiVersion: v1
+kind: Service
+metadata:
+  name: kafka
+  labels: { app: kafka }
+spec:
+  selector: { app: kafka }
+  ports:
+    - { name: broker, port: 9092 }
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: kafka
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels: { app: kafka }
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: kafka
+  labels: { app: kafka }
+spec:
+  serviceName: kafka-headless
+  replicas: 3
+  # All three start together: a quorum needs a majority of controllers up,
+  # so starting them one at a time would wait forever on the first.
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels: { app: kafka }
+  template:
+    metadata:
+      labels: { app: kafka }
+    spec:
+      # Service links would inject KAFKA_PORT and friends, which the image
+      # turns into broker properties.
+      enableServiceLinks: false
+      terminationGracePeriodSeconds: 60
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels: { app: kafka }
+      containers:
+        - name: kafka
+          image: apache/kafka:3.8.0
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              export KAFKA_NODE_ID="${HOSTNAME##*-}"
+              export KAFKA_ADVERTISED_LISTENERS="PLAINTEXT://${HOSTNAME}.kafka-headless.${POD_NAMESPACE}.svc.cluster.local:9092"
+              exec /etc/kafka/docker/run
+          env:
+            - name: POD_NAMESPACE
+              valueFrom: { fieldRef: { fieldPath: metadata.namespace } }
+            - { name: CLUSTER_ID, value: MkU3OEVBNTcwNTJENDM2Qk }
+            - { name: KAFKA_PROCESS_ROLES, value: "broker,controller" }
+            - { name: KAFKA_LISTENERS, value: "PLAINTEXT://:9092,CONTROLLER://:9093" }
+            - { name: KAFKA_LISTENER_SECURITY_PROTOCOL_MAP, value: "PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT" }
+            - { name: KAFKA_CONTROLLER_LISTENER_NAMES, value: CONTROLLER }
+            - { name: KAFKA_INTER_BROKER_LISTENER_NAME, value: PLAINTEXT }
+            - name: KAFKA_CONTROLLER_QUORUM_VOTERS
+              value: "0@kafka-0.kafka-headless:9093,1@kafka-1.kafka-headless:9093,2@kafka-2.kafka-headless:9093"
+            - { name: KAFKA_LOG_DIRS, value: /var/lib/kafka/data/logs }
+            - { name: KAFKA_DEFAULT_REPLICATION_FACTOR, value: "3" }
+            - { name: KAFKA_MIN_INSYNC_REPLICAS, value: "2" }
+            - { name: KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR, value: "3" }
+            - { name: KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR, value: "3" }
+            - { name: KAFKA_TRANSACTION_STATE_LOG_MIN_ISR, value: "2" }
+            - { name: KAFKA_UNCLEAN_LEADER_ELECTION_ENABLE, value: "false" }
+            - { name: KAFKA_AUTO_CREATE_TOPICS_ENABLE, value: "false" }
+            - { name: KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS, value: "0" }
+            - { name: KAFKA_HEAP_OPTS, value: "-Xms384m -Xmx384m" }
+          ports:
+            - { name: broker, containerPort: 9092 }
+            - { name: controller, containerPort: 9093 }
+          startupProbe:
+            tcpSocket: { port: broker }
+            periodSeconds: 5
+            failureThreshold: 60
+          readinessProbe:
+            tcpSocket: { port: broker }
+            periodSeconds: 5
+          livenessProbe:
+            tcpSocket: { port: broker }
+            periodSeconds: 20
+            failureThreshold: 6
+          resources:
+            requests: { cpu: 200m, memory: 640Mi }
+            limits: { memory: 900Mi }
+          volumeMounts:
+            - { name: data, mountPath: /var/lib/kafka/data }
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources:
+          requests: { storage: 2Gi }

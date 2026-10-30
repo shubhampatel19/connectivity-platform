@@ -1,0 +1,10 @@
+# Everything that runs in the cluster for the cloud side. Some config is
+# shared with compose mode (alert rules, dashboards, case rules), so render
+# with the load restrictor off; `make deploy` does:
+#   kubectl kustomize --load-restrictor LoadRestrictionsNone k8s
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: connectivity
+resources:
+  - cloud
+  - observability

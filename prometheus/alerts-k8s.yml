@@ -1,0 +1,97 @@
+# Alerts that only exist in cluster mode: what Kubernetes is doing to the
+# pods, and Kafka replication across the three brokers. Loaded alongside
+# alerts.yml (`make cluster-up`); compose mode doesn't load this file.
+groups:
+  - name: connectivity-cluster
+    rules:
+      - alert: PodRestarting
+        expr: sum by (pod, container) (increase(kube_pod_container_status_restarts_total{namespace="connectivity"}[10m])) >= 3
+        labels: { severity: page }
+        annotations:
+          summary: "{{ $labels.pod }} ({{ $labels.container }}) restarted {{ $value | printf \"%.0f\" }} times in 10 minutes."
+          description: "`kubectl describe pod` shows the last state: OOMKilled, Error with an exit code, or a failed liveness probe. The previous container's logs are in Loki."
+
+      - alert: ContainerOOMKilled
+        expr: |
+          max by (pod, container) (kube_pod_container_status_last_terminated_reason{namespace="connectivity", reason="OOMKilled"})
+            and on (pod, container)
+          sum by (pod, container) (increase(kube_pod_container_status_restarts_total{namespace="connectivity"}[10m])) > 0
+        labels: { severity: ticket }
+        annotations:
+          summary: "{{ $labels.pod }} ({{ $labels.container }}) was killed for exceeding its memory limit."
+          description: Compare its memory panel with its limit. A sawtooth that climbs to the limit is a leak; a jump is one big allocation.
+
+      - alert: ContainerNearMemoryLimit
+        expr: |
+          max by (pod, container) (container_memory_working_set_bytes{namespace="connectivity", container!=""})
+            / on (pod, container)
+          max by (pod, container) (kube_pod_container_resource_limits{namespace="connectivity", resource="memory"}) > 0.9
+        for: 5m
+        labels: { severity: ticket }
+        annotations:
+          summary: "{{ $labels.pod }} ({{ $labels.container }}) has used over 90% of its memory limit for 5 minutes."
+
+      - alert: CPUThrottled
+        expr: |
+          sum by (pod, container) (rate(container_cpu_cfs_throttled_periods_total{namespace="connectivity", container!=""}[5m]))
+            / sum by (pod, container) (rate(container_cpu_cfs_periods_total{namespace="connectivity", container!=""}[5m])) > 0.5
+        for: 5m
+        labels: { severity: ticket }
+        annotations:
+          summary: "{{ $labels.pod }} ({{ $labels.container }}) is CPU-throttled in over half of its scheduling periods."
+          description: Throttling looks like latency, not like errors. Check the processor's and case service's record duration panels.
+
+      - alert: DeploymentReplicasUnavailable
+        expr: max by (deployment) (kube_deployment_status_replicas_unavailable{namespace="connectivity"}) > 0
+        for: 5m
+        labels: { severity: ticket }
+        annotations:
+          summary: "{{ $labels.deployment }} has had {{ $value | printf \"%.0f\" }} unavailable replicas for 5 minutes."
+          description: "Pending pods (`kubectl get pods`, then events) mean no node can fit them; not-ready pods mean their readiness probe fails."
+
+      - alert: StatefulSetReplicasNotReady
+        expr: |
+          max by (statefulset) (kube_statefulset_replicas{namespace="connectivity"})
+            - max by (statefulset) (kube_statefulset_status_replicas_ready{namespace="connectivity"}) > 0
+        for: 3m
+        labels: { severity: page }
+        annotations:
+          summary: "{{ $value | printf \"%.0f\" }} {{ $labels.statefulset }} replicas have not been ready for 3 minutes."
+          description: Their volumes are node-local, so a pod whose node is gone stays Pending until that node returns.
+
+      - alert: KafkaBrokerMissing
+        expr: max(kafka_brokers) < max(max_over_time(kafka_brokers[1h]))
+        for: 1m
+        labels: { severity: page }
+        annotations:
+          summary: "Only {{ $value | printf \"%.0f\" }} Kafka brokers are in the cluster."
+          description: With one broker gone, every partition still has 2 in-sync replicas and producers keep working. With two gone, producing fails.
+
+      - alert: KafkaUnderReplicatedPartitions
+        expr: sum by (topic) (kafka_topic_partition_under_replicated_partition) > 0
+        for: 2m
+        labels: { severity: ticket }
+        annotations:
+          summary: "{{ $value | printf \"%.0f\" }} partitions of {{ $labels.topic }} are missing a replica."
+          description: Normal while a broker restarts and catches up. If it lasts, a broker is down or can't keep up with its leaders.
+
+      - alert: KafkaPartitionsBelowMinISR
+        expr: |
+          count by (topic) (
+            kafka_topic_partition_in_sync_replica < 2
+              and on (topic, partition)
+            kafka_topic_partition_replicas >= 3
+          ) > 0
+        for: 30s
+        labels: { severity: page }
+        annotations:
+          summary: "{{ $value | printf \"%.0f\" }} partitions of {{ $labels.topic }} have fewer than 2 in-sync replicas."
+          description: Producers using acks=all (the ingest API) get NOT_ENOUGH_REPLICAS for these partitions, so devices get 503s and buffer.
+
+      - alert: KafkaPartitionOffline
+        expr: count by (topic) (kafka_topic_partition_leader == -1) > 0
+        for: 30s
+        labels: { severity: page }
+        annotations:
+          summary: "{{ $value | printf \"%.0f\" }} partitions of {{ $labels.topic }} have no leader."
+          description: Unclean leader election is off, so these stay offline until a broker holding an in-sync copy returns.

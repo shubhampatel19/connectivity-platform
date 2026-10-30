@@ -1,0 +1,102 @@
+# The cloud's front door. Stateless (bundle upload sessions live in the
+# object store), so it runs as two replicas behind the Traefik ingress that
+# k3s ships with; devices reach it on host port 8080 through the WAN proxy.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ingest-api
+  labels: { app: ingest-api }
+spec:
+  replicas: 2
+  selector:
+    matchLabels: { app: ingest-api }
+  strategy:
+    rollingUpdate: { maxSurge: 1, maxUnavailable: 0 }
+  template:
+    metadata:
+      labels: { app: ingest-api }
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+    spec:
+      enableServiceLinks: false
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: ingest-api
+          image: connectivity/ingest-api
+          env:
+            - { name: KAFKA_BROKERS, value: "kafka:9092" }
+            - name: TOKEN_SECRET
+              valueFrom: { secretKeyRef: { name: connectivity, key: TOKEN_SECRET } }
+            - name: ENROLLMENT_KEY
+              valueFrom: { secretKeyRef: { name: connectivity, key: ENROLLMENT_KEY } }
+            - { name: S3_ENDPOINT, value: "object-store:8333" }
+            - name: S3_ACCESS_KEY
+              valueFrom: { secretKeyRef: { name: connectivity, key: S3_ACCESS_KEY } }
+            - name: S3_SECRET_KEY
+              valueFrom: { secretKeyRef: { name: connectivity, key: S3_SECRET_KEY } }
+            - { name: S3_BUCKET, value: log-bundles }
+            - { name: LOG_LEVEL, value: info }
+          ports:
+            - { name: http, containerPort: 8080 }
+          # Ready means Kafka is reachable. The object store is deliberately
+          # not part of it (see the ingest API README).
+          readinessProbe:
+            httpGet: { path: /readyz, port: http }
+            periodSeconds: 5
+            failureThreshold: 2
+          livenessProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 10
+            failureThreshold: 3
+          lifecycle:
+            # Keep serving while the ingress notices this pod is going away;
+            # only then does SIGTERM start the drain. Without this, a rollout
+            # sends a few requests to a pod that has already stopped listening.
+            preStop:
+              sleep: { seconds: 5 }
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            limits: { memory: 256Mi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: [ALL] }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ingest-api
+  labels: { app: ingest-api }
+spec:
+  selector: { app: ingest-api }
+  ports:
+    - { name: http, port: 8080, targetPort: http }
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: ingest-api
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels: { app: ingest-api }
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: ingest-api
+spec:
+  ingressClassName: traefik
+  rules:
+    - http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: ingest-api
+                port: { name: http }

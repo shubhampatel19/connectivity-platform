@@ -1,0 +1,19 @@
+# Kill one telemetry processor every minute until you delete this schedule
+# (`make chaos-stop`). Each kill rebalances the consumer group. Questions:
+# does lag ever recover between kills, and does any batch get stored twice?
+apiVersion: chaos-mesh.org/v1alpha1
+kind: Schedule
+metadata:
+  name: processor-kill-every-minute
+  namespace: connectivity
+spec:
+  schedule: "@every 1m"
+  type: PodChaos
+  historyLimit: 3
+  concurrencyPolicy: Forbid
+  podChaos:
+    action: pod-kill
+    mode: one
+    selector:
+      namespaces: [connectivity]
+      labelSelectors: { app: telemetry-processor }

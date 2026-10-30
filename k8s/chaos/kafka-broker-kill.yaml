@@ -1,0 +1,14 @@
+# Kill one random Kafka broker. It comes back on the same node with its data
+# a few seconds later. Producers (acks=all, min ISR 2) shouldn't notice;
+# watch under-replicated partitions rise and fall on the cluster dashboard.
+apiVersion: chaos-mesh.org/v1alpha1
+kind: PodChaos
+metadata:
+  name: kafka-broker-kill
+  namespace: connectivity
+spec:
+  action: pod-kill
+  mode: one
+  selector:
+    namespaces: [connectivity]
+    labelSelectors: { app: kafka }

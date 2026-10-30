@@ -1,0 +1,24 @@
+# 30% packet loss between the ingest API and the brokers, for 5 minutes.
+# Requests don't fail outright; they get slow, some exceed the produce
+# timeout, and devices start retrying. Find it from the ingest latency panel.
+apiVersion: chaos-mesh.org/v1alpha1
+kind: NetworkChaos
+metadata:
+  name: ingest-kafka-packet-loss
+  namespace: connectivity
+spec:
+  action: loss
+  mode: all
+  selector:
+    namespaces: [connectivity]
+    labelSelectors: { app: ingest-api }
+  loss:
+    loss: "30"
+    correlation: "25"
+  direction: to
+  target:
+    mode: all
+    selector:
+      namespaces: [connectivity]
+      labelSelectors: { app: kafka }
+  duration: 5m

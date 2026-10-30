@@ -1,0 +1,38 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - namespace.yaml
+  - kafka.yaml
+  - kafka-topics.yaml
+  - postgres.yaml
+  - object-store.yaml
+  - ingest-api.yaml
+  - telemetry-processor.yaml
+  - case-service.yaml
+# Development credentials, the same defaults compose mode uses. Edge devices
+# must present the same ENROLLMENT_KEY.
+secretGenerator:
+  - name: connectivity
+    literals:
+      - TOKEN_SECRET=dev-token-secret-change-me
+      - ENROLLMENT_KEY=dev-enrollment-key
+      - S3_ACCESS_KEY=connectivity
+      - S3_SECRET_KEY=connectivity-secret
+      - POSTGRES_PASSWORD=connectivity
+      - DATABASE_URL=postgres://connectivity:connectivity@postgres:5432/connectivity?sslmode=disable
+  - name: object-store-s3
+    files:
+      - ../../seaweedfs/s3.json
+configMapGenerator:
+  # Edit case-service/rules.json, then `make deploy`: the ConfigMap name
+  # carries a hash of its content, so the case service rolls automatically.
+  - name: case-rules
+    files:
+      - ../../case-service/rules.json
+images:
+  - name: connectivity/ingest-api
+    newTag: dev
+  - name: connectivity/telemetry-processor
+    newTag: dev
+  - name: connectivity/case-service
+    newTag: dev

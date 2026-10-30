@@ -1,0 +1,91 @@
+# Device alerts -> support cases. Two replicas in one consumer group; the
+# partial unique index and the site-storm advisory lock are what keep them
+# from opening the same case twice. Rules come from case-service/rules.json
+# at the repo root, the same file compose mode mounts.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: case-service
+  labels: { app: case-service }
+spec:
+  replicas: 2
+  selector:
+    matchLabels: { app: case-service }
+  strategy:
+    rollingUpdate: { maxSurge: 1, maxUnavailable: 0 }
+  template:
+    metadata:
+      labels: { app: case-service }
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8085"
+    spec:
+      enableServiceLinks: false
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: case-service
+          image: connectivity/case-service
+          env:
+            - { name: KAFKA_BROKERS, value: "kafka:9092" }
+            - name: DATABASE_URL
+              valueFrom: { secretKeyRef: { name: connectivity, key: DATABASE_URL } }
+            - { name: RULES_FILE, value: /etc/case-service/rules.json }
+            - { name: LOG_LEVEL, value: info }
+          ports:
+            - { name: http, containerPort: 8085 }
+          readinessProbe:
+            httpGet: { path: /readyz, port: http }
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 10
+            failureThreshold: 3
+          lifecycle:
+            preStop:
+              sleep: { seconds: 5 }
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            limits: { memory: 256Mi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: [ALL] }
+          volumeMounts:
+            - { name: rules, mountPath: /etc/case-service, readOnly: true }
+      volumes:
+        - name: rules
+          configMap: { name: case-rules }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: case-service
+  labels: { app: case-service }
+spec:
+  selector: { app: case-service }
+  ports:
+    - { name: http, port: 8085, targetPort: http }
+---
+# The case API on host port 8085, as in compose mode (make cases, make case).
+apiVersion: v1
+kind: Service
+metadata:
+  name: case-service-external
+  labels: { app: case-service }
+spec:
+  type: NodePort
+  selector: { app: case-service }
+  ports:
+    - { name: http, port: 8085, targetPort: http, nodePort: 30085 }
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: case-service
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels: { app: case-service }

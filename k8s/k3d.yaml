@@ -1,0 +1,37 @@
+# The cloud side as a small Kubernetes cluster: one server and two agent
+# nodes, so pods spread across "machines" and a node can be lost in a drill.
+# `make cluster-up` creates it; the edge keeps running in Docker and reaches
+# the cloud through the WAN proxy, the way a customer site reaches a real
+# cloud through the internet.
+#
+# Host ports match compose mode, so the same make targets and URLs work:
+#   8080 ingest API (Traefik ingress, the cloud's public front door)
+#   8085 case service API   3000 Grafana   9090 Prometheus
+#   8888 object store filer 2333 Chaos Mesh dashboard (after `make chaos-install`)
+apiVersion: k3d.io/v1alpha5
+kind: Simple
+metadata:
+  name: connectivity
+servers: 1
+agents: 2
+image: rancher/k3s:v1.35.9-k3s1
+ports:
+  - port: 8080:80
+    nodeFilters: [loadbalancer]
+  - port: 8085:30085
+    nodeFilters: [loadbalancer]
+  - port: 3000:30300
+    nodeFilters: [loadbalancer]
+  - port: 9090:30090
+    nodeFilters: [loadbalancer]
+  - port: 8888:30888
+    nodeFilters: [loadbalancer]
+  - port: 2333:30233
+    nodeFilters: [loadbalancer]
+options:
+  k3d:
+    wait: true
+    timeout: 180s
+  kubeconfig:
+    updateDefaultKubeconfig: true
+    switchCurrentContext: false

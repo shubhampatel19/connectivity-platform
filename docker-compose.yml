@@ -4,15 +4,33 @@
 # Prometheus and Grafana watching all of it.
 #
 # Two edge sites: site A's devices talk to the cloud directly; site B's
-# devices talk to an on-site gateway (Java) that stores and forwards.
+# devices talk to an on-site gateway (Java) that stores and forwards. Both
+# sites reach the cloud through "wan", a Toxiproxy with one link per site,
+# so a WAN can be slowed, broken or cut for one site at a time.
+#
+# The cloud services carry the "cloud" profile. `make up` turns it on, so
+# this file runs everything. In cluster mode (`make cluster-up`) the cloud
+# runs on k3d instead, and only the edge and the WAN start from here, with
+# WAN_UPSTREAM pointing at the cluster's ingress.
 #
 # Service images build from sibling clones of each component repo. Run
 # scripts/bootstrap.sh once to set up that layout.
 name: connectivity
 
+configs:
+  # Proxies loaded when the WAN starts. Toxics added later (make wan-*) live
+  # in memory and are gone after a restart of the wan container.
+  wan-proxies:
+    content: |
+      [
+        {"name": "site-a", "listen": "0.0.0.0:18080", "upstream": "${WAN_UPSTREAM:-ingest-api:8080}", "enabled": true},
+        {"name": "site-b", "listen": "0.0.0.0:18081", "upstream": "${WAN_UPSTREAM:-ingest-api:8080}", "enabled": true}
+      ]
+
 services:
   # ---------- cloud: data plane ----------
   kafka:
+    profiles: [cloud]
     image: apache/kafka:3.8.0
     hostname: kafka
     ports:
@@ -43,6 +61,7 @@ services:
   # Topics are created explicitly: partition counts matter for ordering,
   # parallelism and some of the failure drills.
   kafka-init:
+    profiles: [cloud]
     image: apache/kafka:3.8.0
     depends_on:
       kafka: { condition: service_healthy }
@@ -58,6 +77,7 @@ services:
     restart: "no"
 
   postgres:
+    profiles: [cloud]
     image: postgres:16-alpine
     environment:
       POSTGRES_USER: connectivity
@@ -80,6 +100,7 @@ services:
   # S3 API on 8333; the filer on 8888 lets you browse stored bundles.
   # Credentials live in seaweedfs/s3.json and must match S3_ACCESS_KEY/S3_SECRET_KEY.
   object-store:
+    profiles: [cloud]
     image: chrislusf/seaweedfs:4.47
     command: ["server", "-dir=/data", "-s3", "-s3.port=8333", "-s3.config=/etc/seaweedfs/s3.json", "-metricsPort=9324"]
     ports:
@@ -97,6 +118,7 @@ services:
 
   # ---------- cloud: services ----------
   ingest-api:
+    profiles: [cloud]
     build: ../connectivity-ingest-api
     image: connectivity/ingest-api:dev
     environment:
@@ -117,6 +139,7 @@ services:
     restart: unless-stopped
 
   telemetry-processor:
+    profiles: [cloud]
     build: ../connectivity-telemetry-processor
     image: connectivity/telemetry-processor:dev
     environment:
@@ -133,6 +156,7 @@ services:
   # Device alerts -> support cases. Rules come from case-service/rules.json:
   # edit it and `make restart s=case-service` to change thresholds.
   case-service:
+    profiles: [cloud]
     build: ../connectivity-case-service
     image: connectivity/case-service:dev
     environment:
@@ -149,12 +173,30 @@ services:
       postgres: { condition: service_healthy }
     restart: unless-stopped
 
+  # ---------- the WAN between the sites and the cloud ----------
+  # Toxiproxy: site-a on :18080, site-b on :18081, both forwarding to the
+  # cloud's front door. `make wan` shows the links; make wan-latency,
+  # wan-bandwidth, wan-flaky, wan-blackhole and wan-down break them.
+  wan:
+    image: ghcr.io/shopify/toxiproxy:2.12.0
+    command: ["-host=0.0.0.0", "-config=/etc/toxiproxy/proxies.json", "-proxy-metrics"]
+    configs:
+      - source: wan-proxies
+        target: /etc/toxiproxy/proxies.json
+    ports:
+      - "8474:8474" # Toxiproxy API and /metrics
+    # In cluster mode the cloud's front door is the k3d load balancer on the
+    # Docker host's port 8080.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+
   # ---------- edge: site A, devices talk to the cloud directly ----------
   edge-agent:
     build: ../connectivity-edge-agent
     image: connectivity/edge-agent:dev
     environment:
-      INGEST_URL: http://ingest-api:8080
+      INGEST_URL: http://wan:18080
       ENROLLMENT_KEY: ${ENROLLMENT_KEY:-dev-enrollment-key}
       SITE_ID: site-a
       DEVICE_COUNT: ${DEVICE_COUNT:-200}
@@ -166,7 +208,7 @@ services:
     ports:
       - "9102:9102"
     depends_on:
-      - ingest-api
+      - wan
     restart: unless-stopped
 
   # ---------- edge: site B, devices talk to the cloud through a gateway ----------
@@ -177,7 +219,7 @@ services:
     build: ../connectivity-site-gateway
     image: connectivity/site-gateway:dev
     environment:
-      UPSTREAM_URL: http://ingest-api:8080
+      UPSTREAM_URL: http://wan:18081
       GATEWAY_ID: site-b-gateway
       JAVA_OPTS: ${GATEWAY_JAVA_OPTS:--Xms64m -Xmx256m -XX:+UseG1GC -XX:+ExitOnOutOfMemoryError}
       LOG_LEVEL: ${GATEWAY_LOG_LEVEL:-info}
@@ -186,7 +228,7 @@ services:
     volumes:
       - gateway-data:/var/lib/connectivity-gateway
     depends_on:
-      - ingest-api
+      - wan
     restart: unless-stopped
 
   edge-agent-site-b:
@@ -210,6 +252,7 @@ services:
 
   # ---------- observability ----------
   kafka-exporter:
+    profiles: [cloud]
     image: danielqsj/kafka-exporter:v1.7.0
     command: ["--kafka.server=kafka:9092"]
     depends_on:
@@ -217,6 +260,7 @@ services:
     restart: unless-stopped
 
   prometheus:
+    profiles: [cloud]
     image: prom/prometheus:v2.53.0
     volumes:
       - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
@@ -226,6 +270,7 @@ services:
     restart: unless-stopped
 
   grafana:
+    profiles: [cloud]
     image: grafana/grafana:11.1.0
     environment:
       GF_AUTH_ANONYMOUS_ENABLED: "true"

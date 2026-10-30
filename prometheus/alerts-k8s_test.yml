@@ -1,0 +1,121 @@
+# Unit tests for the cluster-only rules: `promtool test rules prometheus/alerts-k8s_test.yml`.
+rule_files: [alerts-k8s.yml]
+evaluation_interval: 30s
+tests:
+  # A processor pod OOM-killed three times in ten minutes, and one more pod
+  # close to its limit.
+  - interval: 1m
+    input_series:
+      - series: 'kube_pod_container_status_restarts_total{namespace="connectivity",pod="telemetry-processor-abc",container="telemetry-processor"}'
+        values: '0 0 1 1 2 2 3 3 3 3 3 3'
+      - series: 'kube_pod_container_status_last_terminated_reason{namespace="connectivity",pod="telemetry-processor-abc",container="telemetry-processor",reason="OOMKilled"}'
+        values: '_ _ 1x10'
+      - series: 'container_memory_working_set_bytes{namespace="connectivity",pod="case-service-xyz",container="case-service"}'
+        values: '250000000x12'
+      - series: 'kube_pod_container_resource_limits{namespace="connectivity",pod="case-service-xyz",container="case-service",resource="memory",unit="byte"}'
+        values: '268435456x12'
+    alert_rule_test:
+      - eval_time: 7m
+        alertname: PodRestarting
+        exp_alerts:
+          - exp_labels: { severity: page, pod: telemetry-processor-abc, container: telemetry-processor }
+            exp_annotations:
+              summary: "telemetry-processor-abc (telemetry-processor) restarted 3 times in 10 minutes."
+              description: "`kubectl describe pod` shows the last state: OOMKilled, Error with an exit code, or a failed liveness probe. The previous container's logs are in Loki."
+      - eval_time: 4m
+        alertname: ContainerOOMKilled
+        exp_alerts:
+          - exp_labels: { severity: ticket, pod: telemetry-processor-abc, container: telemetry-processor }
+            exp_annotations:
+              summary: "telemetry-processor-abc (telemetry-processor) was killed for exceeding its memory limit."
+              description: Compare its memory panel with its limit. A sawtooth that climbs to the limit is a leak; a jump is one big allocation.
+      - eval_time: 6m
+        alertname: ContainerNearMemoryLimit
+        exp_alerts:
+          - exp_labels: { severity: ticket, pod: case-service-xyz, container: case-service }
+            exp_annotations:
+              summary: "case-service-xyz (case-service) has used over 90% of its memory limit for 5 minutes."
+
+  # Kafka: a broker goes away, partitions lose a replica; then a second one
+  # goes and a partition drops below min ISR.
+  - interval: 30s
+    input_series:
+      - series: 'kafka_brokers{job="kafka"}'
+        values: '3x10 2x10 1x10'
+      - series: 'kafka_topic_partition_replicas{job="kafka",topic="telemetry.raw",partition="0"}'
+        values: '3x30'
+      - series: 'kafka_topic_partition_in_sync_replica{job="kafka",topic="telemetry.raw",partition="0"}'
+        values: '3x10 2x10 1x10'
+      - series: 'kafka_topic_partition_under_replicated_partition{job="kafka",topic="telemetry.raw",partition="0"}'
+        values: '0x10 1x20'
+      - series: 'kafka_topic_partition_leader{job="kafka",topic="telemetry.raw",partition="0"}'
+        values: '1x30'
+    alert_rule_test:
+      - eval_time: 7m
+        alertname: KafkaBrokerMissing
+        exp_alerts:
+          - exp_labels: { severity: page }
+            exp_annotations:
+              summary: "Only 2 Kafka brokers are in the cluster."
+              description: With one broker gone, every partition still has 2 in-sync replicas and producers keep working. With two gone, producing fails.
+      - eval_time: 8m
+        alertname: KafkaUnderReplicatedPartitions
+        exp_alerts:
+          - exp_labels: { severity: ticket, topic: telemetry.raw }
+            exp_annotations:
+              summary: "1 partitions of telemetry.raw are missing a replica."
+              description: Normal while a broker restarts and catches up. If it lasts, a broker is down or can't keep up with its leaders.
+      - eval_time: 8m
+        alertname: KafkaPartitionsBelowMinISR
+        exp_alerts: []
+      - eval_time: 12m
+        alertname: KafkaPartitionsBelowMinISR
+        exp_alerts:
+          - exp_labels: { severity: page, topic: telemetry.raw }
+            exp_annotations:
+              summary: "1 partitions of telemetry.raw have fewer than 2 in-sync replicas."
+              description: Producers using acks=all (the ingest API) get NOT_ENOUGH_REPLICAS for these partitions, so devices get 503s and buffer.
+
+  # Compose mode: one broker, replication factor 1. None of this may fire.
+  - interval: 30s
+    input_series:
+      - series: 'kafka_brokers{job="kafka"}'
+        values: '1x20'
+      - series: 'kafka_topic_partition_replicas{job="kafka",topic="telemetry.raw",partition="0"}'
+        values: '1x20'
+      - series: 'kafka_topic_partition_in_sync_replica{job="kafka",topic="telemetry.raw",partition="0"}'
+        values: '1x20'
+      - series: 'kafka_topic_partition_under_replicated_partition{job="kafka",topic="telemetry.raw",partition="0"}'
+        values: '0x20'
+    alert_rule_test:
+      - eval_time: 9m
+        alertname: KafkaBrokerMissing
+        exp_alerts: []
+      - eval_time: 9m
+        alertname: KafkaPartitionsBelowMinISR
+        exp_alerts: []
+
+  # A broker volume's node is gone: one kafka replica stays unready.
+  - interval: 1m
+    input_series:
+      - series: 'kube_statefulset_replicas{namespace="connectivity",statefulset="kafka"}'
+        values: '3x10'
+      - series: 'kube_statefulset_status_replicas_ready{namespace="connectivity",statefulset="kafka"}'
+        values: '3 3 2 2 2 2 2 2 2 2'
+      - series: 'kafka_topic_partition_leader{job="kafka",topic="device.alerts",partition="2"}'
+        values: '0 0 -1 -1 -1 -1 -1 -1 -1 -1'
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: StatefulSetReplicasNotReady
+        exp_alerts:
+          - exp_labels: { severity: page, statefulset: kafka }
+            exp_annotations:
+              summary: "1 kafka replicas have not been ready for 3 minutes."
+              description: Their volumes are node-local, so a pod whose node is gone stays Pending until that node returns.
+      - eval_time: 4m
+        alertname: KafkaPartitionOffline
+        exp_alerts:
+          - exp_labels: { severity: page, topic: device.alerts }
+            exp_annotations:
+              summary: "1 partitions of device.alerts have no leader."
+              description: Unclean leader election is off, so these stay offline until a broker holding an in-sync copy returns.

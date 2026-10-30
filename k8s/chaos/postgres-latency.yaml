@@ -1,0 +1,19 @@
+# 300ms (±50ms) added to everything Postgres sends, for 5 minutes. Each
+# processor transaction gets slower, throughput falls, and consumer lag
+# grows even though nothing is failing.
+apiVersion: chaos-mesh.org/v1alpha1
+kind: NetworkChaos
+metadata:
+  name: postgres-latency
+  namespace: connectivity
+spec:
+  action: delay
+  mode: all
+  selector:
+    namespaces: [connectivity]
+    labelSelectors: { app: postgres }
+  delay:
+    latency: 300ms
+    jitter: 50ms
+    correlation: "25"
+  duration: 5m

@@ -1,0 +1,15 @@
+# The object store unavailable for 5 minutes (warm-up drill 4, in the
+# cluster). Telemetry must be unaffected and the ingest API must stay ready;
+# bundles wait in device spools and alert cases show logs=waiting.
+apiVersion: chaos-mesh.org/v1alpha1
+kind: PodChaos
+metadata:
+  name: object-store-down
+  namespace: connectivity
+spec:
+  action: pod-failure
+  mode: all
+  duration: 5m
+  selector:
+    namespaces: [connectivity]
+    labelSelectors: { app: object-store }

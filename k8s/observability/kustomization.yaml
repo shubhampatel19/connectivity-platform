@@ -1,0 +1,37 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - prometheus.yaml
+  - kube-state-metrics.yaml
+  - kafka-exporter.yaml
+  - loki.yaml
+  - alloy.yaml
+  - tempo.yaml
+  - grafana.yaml
+configMapGenerator:
+  - name: prometheus-config
+    files:
+      - prometheus.yml
+  # The same alert rules compose mode loads, plus rules that only make sense
+  # on Kubernetes (restarts, OOM kills, Kafka replication).
+  - name: prometheus-rules
+    files:
+      - ../../prometheus/alerts.yml
+      - ../../prometheus/alerts-k8s.yml
+  - name: loki-config
+    files:
+      - loki.yaml=loki-config.yaml
+  - name: alloy-config
+    files:
+      - config.alloy
+  - name: tempo-config
+    files:
+      - tempo.yaml=tempo-config.yaml
+  - name: grafana-datasources
+    files:
+      - grafana-datasources.yml
+  - name: grafana-dashboards
+    files:
+      - ../../grafana/provisioning/dashboards/provider.yml
+      - ../../grafana/provisioning/dashboards/connectivity-overview.json
+      - dashboards/connectivity-cluster.json

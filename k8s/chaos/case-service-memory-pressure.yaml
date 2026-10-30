@@ -1,0 +1,18 @@
+# A stress process inside one case-service pod allocates 220MB of its 256Mi
+# limit for 5 minutes. ContainerNearMemoryLimit should fire. If the kernel
+# OOM-kills something, which process does it pick, and does the pod restart?
+apiVersion: chaos-mesh.org/v1alpha1
+kind: StressChaos
+metadata:
+  name: case-service-memory-pressure
+  namespace: connectivity
+spec:
+  mode: one
+  selector:
+    namespaces: [connectivity]
+    labelSelectors: { app: case-service }
+  stressors:
+    memory:
+      workers: 1
+      size: 220MB
+  duration: 5m

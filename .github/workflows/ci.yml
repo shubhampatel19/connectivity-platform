@@ -23,8 +23,34 @@ jobs:
           docker run --rm -v "$PWD/prometheus:/etc/prometheus:ro" \
             --entrypoint promtool prom/prometheus:v2.53.0 \
             test rules /etc/prometheus/alerts_test.yml
+      - name: Cluster-only alert rules and the cluster Prometheus config
+        run: |
+          docker run --rm -v "$PWD/prometheus:/etc/prometheus:ro" \
+            --entrypoint promtool prom/prometheus:v2.53.0 \
+            test rules /etc/prometheus/alerts-k8s_test.yml
+          # Syntax only: the service account token it reads exists only in a pod.
+          docker run --rm -v "$PWD/k8s/observability:/cfg:ro" \
+            --entrypoint promtool prom/prometheus:v2.53.0 \
+            check config --syntax-only /cfg/prometheus.yml
       - name: Grafana dashboard JSON
-        run: python3 -m json.tool grafana/provisioning/dashboards/connectivity-overview.json > /dev/null
+        run: |
+          python3 -m json.tool grafana/provisioning/dashboards/connectivity-overview.json > /dev/null
+          python3 -m json.tool k8s/observability/dashboards/connectivity-cluster.json > /dev/null
+      - name: Compose file in both modes
+        run: |
+          COMPOSE_PROFILES=cloud docker compose config -q
+          COMPOSE_PROFILES='' WAN_UPSTREAM=host.docker.internal:8080 docker compose config -q
+      - name: Kubernetes manifests and chaos experiments against their schemas
+        run: |
+          curl -fsSL https://github.com/yannh/kubeconform/releases/download/v0.7.0/kubeconform-linux-amd64.tar.gz | tar xz -C /tmp kubeconform
+          kubectl kustomize --load-restrictor LoadRestrictionsNone k8s > /tmp/cloud.yaml
+          /tmp/kubeconform -strict -summary -kubernetes-version 1.35.0 /tmp/cloud.yaml
+          # Chaos Mesh publishes CRDs, not JSON schemas; convert them.
+          mkdir -p /tmp/crd
+          curl -fsSL -o /tmp/crd/crd.yaml https://raw.githubusercontent.com/chaos-mesh/chaos-mesh/v2.8.4/manifests/crd.yaml
+          curl -fsSL -o /tmp/crd/o2j.py https://raw.githubusercontent.com/yannh/kubeconform/v0.7.0/scripts/openapi2jsonschema.py
+          (cd /tmp/crd && pip install -q pyyaml && FILENAME_FORMAT='{kind}_{version}' python3 o2j.py crd.yaml > /dev/null)
+          /tmp/kubeconform -strict -summary -schema-location '/tmp/crd/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json' k8s/chaos/*.yaml
 
   # Runs the whole stack the way `make up` does and checks that telemetry from
   # simulated devices actually lands in Postgres, from both sites, including
@@ -43,6 +69,8 @@ jobs:
       BUNDLE_TRACE_BYTES: "262144"
       # No spontaneous faults: every alert in this run is one the test injected.
       FAULT_RATE: "0"
+      # Compose mode: the cloud services too, not just the edge.
+      COMPOSE_PROFILES: cloud
     steps:
       - uses: actions/checkout@v5
         with:
@@ -262,3 +290,251 @@ jobs:
         if: always()
         working-directory: connectivity-platform
         run: docker compose down -v
+
+  # Cluster mode end to end: the cloud on a three-node k3d cluster with three
+  # Kafka brokers, the edge in Compose behind the WAN proxy. The same data
+  # paths as the smoke test, then what only this mode has: one site's WAN cut
+  # while the other carries on, a rolling deploy the devices never notice,
+  # logs in Loki through Grafana, and a Kafka broker killed by Chaos Mesh
+  # with nothing lost.
+  cluster:
+    needs: lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      DEVICE_COUNT: "50"
+      SITE_B_DEVICE_COUNT: "30"
+      SEND_INTERVAL: 2s
+      BUNDLE_INTERVAL: 20s
+      BUNDLE_TRACE_BYTES: "262144"
+      FAULT_RATE: "0"
+      K3D_VERSION: v5.9.0
+    defaults:
+      run:
+        working-directory: connectivity-platform
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          path: connectivity-platform
+
+      - name: Clone component repos
+        working-directory: .
+        run: |
+          for repo in connectivity-edge-agent connectivity-ingest-api connectivity-telemetry-processor connectivity-site-gateway connectivity-case-service; do
+            git clone --depth 1 "https://github.com/${{ github.repository_owner }}/$repo.git"
+          done
+
+      - name: Install k3d
+        run: |
+          curl -fsSL -o /tmp/k3d "https://github.com/k3d-io/k3d/releases/download/$K3D_VERSION/k3d-linux-amd64"
+          sudo install -m 0755 /tmp/k3d /usr/local/bin/k3d
+          k3d version && kubectl version --client && helm version --short
+
+      - name: make cluster-up
+        run: |
+          enc() { sed -e ':a' -e 'N' -e '$!ba' -e 's/%/%25/g' -e 's/\r//g' -e 's/\n/%0A/g'; }
+          if ! make cluster-up > /tmp/cluster-up.log 2>&1; then
+            tail -n 100 /tmp/cluster-up.log
+            echo "::error title=make cluster-up failed::$(tail -n 30 /tmp/cluster-up.log | enc)"
+            exit 1
+          fi
+          tail -n 40 /tmp/cluster-up.log
+          ./scripts/cluster.sh status
+
+      - name: Three brokers, every partition fully replicated
+        run: |
+          brokers=$(./scripts/cloud.sh kafka kafka-broker-api-versions 2>/dev/null | grep -c '^kafka-')
+          urp=$(./scripts/cloud.sh kafka kafka-topics --describe --under-replicated-partitions | grep -c 'Topic:' || true)
+          rf=$(./scripts/cloud.sh kafka kafka-topics --describe --topic telemetry.raw | grep -o 'ReplicationFactor: [0-9]*' | head -1)
+          echo "brokers: $brokers; telemetry.raw $rf; under-replicated partitions: $urp"
+          [ "$brokers" = 3 ] || { echo "::error::expected 3 brokers, found $brokers"; exit 1; }
+          [ "$rf" = "ReplicationFactor: 3" ] || { echo "::error::telemetry.raw is not replicated 3 ways ($rf)"; exit 1; }
+          [ "$urp" = 0 ] || { echo "::error::$urp partitions are under-replicated on a fresh cluster"; exit 1; }
+          kubectl --context k3d-connectivity -n connectivity get pods -l app=kafka -o wide
+
+      - name: Telemetry from both sites reaches Postgres, through the WAN and the ingress
+        run: |
+          q() { ./scripts/cloud.sh sql "$1" 2>/dev/null || echo 0; }
+          site() { q "SELECT count(*) FROM ingested_batches b JOIN devices d USING (device_id) WHERE d.site_id = '$1'"; }
+          for _ in $(seq 1 60); do [ "$(site site-a)" -gt 0 ] && [ "$(site site-b)" -gt 0 ] && break; sleep 5; done
+          echo "batches: site A $(site site-a), site B $(site site-b); samples: $(q 'SELECT count(*) FROM telemetry')"
+          [ "$(site site-a)" -gt 0 ] || { echo "::error::no site A telemetry reached Postgres"; exit 1; }
+          [ "$(site site-b)" -gt 0 ] || { echo "::error::no site B telemetry reached Postgres through the gateway"; exit 1; }
+          [ "$(q 'SELECT (SELECT coalesce(sum(sample_count),0) FROM ingested_batches) = (SELECT count(*) FROM telemetry)')" = t ] \
+            || { echo "::error::sample count does not match batch markers"; exit 1; }
+
+      - name: A log bundle lands in the object store and the index
+        run: |
+          q() { ./scripts/cloud.sh sql "$1" 2>/dev/null || echo 0; }
+          for _ in $(seq 1 60); do [ "$(q 'SELECT count(*) FROM log_bundles')" -gt 0 ] && break; sleep 5; done
+          [ "$(q 'SELECT count(*) FROM log_bundles')" -gt 0 ] || { echo "::error::no log bundle was indexed within 5 minutes"; exit 1; }
+          read -r key size <<<"$(q "SELECT object_key || ' ' || size_bytes FROM log_bundles ORDER BY indexed_at LIMIT 1")"
+          stored=$(curl -sI "localhost:8888/buckets/log-bundles/$key" | awk 'tolower($1) == "content-length:" {print $2}' | tr -d '\r')
+          echo "bundle $key: index says $size bytes, object store has $stored"
+          [ "$stored" = "$size" ] || { echo "::error::$key is '$stored' bytes in the object store but the index says $size"; exit 1; }
+
+      - name: A device fault becomes exactly one case
+        run: |
+          py() { python3 -c "$1"; }
+          for _ in $(seq 1 24); do curl -fsS -o /dev/null localhost:8085/readyz && break; sleep 5; done
+          dev=$(curl -fsS -X POST 'localhost:9102/debug/faults?kind=thermal&devices=1' | py 'import json,sys; print(json.load(sys.stdin)["devices"][0])')
+          n() { curl -fsS "localhost:8085/v1/cases?status=all&device=$dev" | py 'import json,sys; print(len(json.load(sys.stdin)["cases"]))'; }
+          for _ in $(seq 1 36); do [ "$(n)" -ge 1 ] && break; sleep 5; done
+          echo "cases for $dev: $(n)"
+          [ "$(n)" = 1 ] || { echo "::error::one overheat on $dev should open exactly one case, got $(n)"; exit 1; }
+
+      - name: "WAN cut at site B: the gateway queues, site A carries on, nothing is lost"
+        run: |
+          q()  { ./scripts/cloud.sh sql "$1" 2>/dev/null || echo 0; }
+          gm() { curl -s localhost:8090/metrics | awk -v m="$1" 'index($1, m) == 1 && (length($1) == length(m) || substr($1, length(m) + 1, 1) == "{") {t += $2} END {printf "%d\n", t}'; }
+          site() { q "SELECT count(*) FROM ingested_batches b JOIN devices d USING (device_id) WHERE d.site_id = '$1'"; }
+          [ "$(gm connectivity_gateway_queue_records)" -eq 0 ] || { echo "::error::the gateway has a backlog before the WAN cut"; exit 1; }
+          queued0=$(gm connectivity_gateway_queued_total); fwd0=$(gm connectivity_gateway_forwarded_total)
+
+          ./scripts/wan.sh down b
+          t0=$(date +%s); a0=$(site site-a)
+          curl -fsS -X POST 'localhost:9103/debug/faults?kind=disk&devices=1' | python3 -c 'import json,sys; print(json.load(sys.stdin)["devices"][0])' > /tmp/cut-device
+          sleep 45
+          a1=$(site site-a); backlog=$(gm connectivity_gateway_queue_records)
+          echo "45s into the site B WAN cut: gateway backlog $backlog; site A batches $a0 -> $a1"
+          [ "$backlog" -gt 0 ] || { echo "::error::the gateway queued nothing while its WAN link was down"; exit 1; }
+          [ "$a1" -gt "$a0" ] || { echo "::error::site A stopped too, but only site B's link was cut"; exit 1; }
+          curl -fsS -o /dev/null localhost:8090/readyz || { echo "::error::gateway readiness followed its WAN link down"; exit 1; }
+
+          ./scripts/wan.sh up b
+          t1=$(date +%s)
+          for _ in $(seq 1 36); do [ "$(gm connectivity_gateway_queue_records)" -eq 0 ] && break; sleep 5; done
+          [ "$(gm connectivity_gateway_queue_records)" -eq 0 ] || { echo "::error::the gateway queue did not drain within 3 minutes of the link coming back"; exit 1; }
+          queued=$(( $(gm connectivity_gateway_queued_total) - queued0 )); forwarded=$(( $(gm connectivity_gateway_forwarded_total) - fwd0 ))
+          dropped=$(gm connectivity_gateway_queue_dropped_total)
+          echo "WAN cut: $queued queued, $forwarded forwarded, $dropped dropped"
+          [ "$dropped" -eq 0 ] && [ "$queued" -eq "$forwarded" ] || { echo "::error::queued $queued, forwarded $forwarded, dropped $dropped"; exit 1; }
+
+          window="t.ts BETWEEN to_timestamp($t0) AND to_timestamp($t1)"
+          gaps() { q "SELECT count(*) FROM (SELECT ts - lag(ts) OVER (PARTITION BY device_id, metric ORDER BY ts) AS gap FROM telemetry t JOIN devices d USING (device_id) WHERE d.site_id = 'site-b' AND $window) g WHERE gap > interval '10 seconds'"; }
+          covered() { q "SELECT count(DISTINCT device_id) FROM telemetry t JOIN devices d USING (device_id) WHERE d.site_id = 'site-b' AND $window AND t.ts > to_timestamp($t1 - 10)"; }
+          for _ in $(seq 1 24); do [ "$(gaps)" -eq 0 ] && [ "$(covered)" -ge "$SITE_B_DEVICE_COUNT" ] && break; sleep 5; done
+          echo "site B devices with data through the end of the cut: $(covered) of $SITE_B_DEVICE_COUNT; gaps over 10s: $(gaps)"
+          [ "$(covered)" -ge "$SITE_B_DEVICE_COUNT" ] && [ "$(gaps)" -eq 0 ] || { echo "::error::site B telemetry from the WAN cut is missing"; exit 1; }
+
+          dev=$(cat /tmp/cut-device)
+          disk() { curl -fsS "localhost:8085/v1/cases?status=all&device=$dev&rule=disk-reallocating" | python3 -c 'import json,sys; print(len(json.load(sys.stdin)["cases"]))'; }
+          for _ in $(seq 1 24); do [ "$(disk)" -ge 1 ] && break; sleep 5; done
+          [ "$(disk)" = 1 ] || { echo "::error::the disk fault on $dev raised during the WAN cut did not become exactly one case"; exit 1; }
+          echo "::notice title=WAN cut::site B queued $queued batches behind a dead link and delivered all of them; site A was unaffected; the alert raised mid-cut became case for $dev"
+
+      - name: A rolling restart of the ingest API is invisible to devices
+        run: |
+          k() { kubectl --context k3d-connectivity -n connectivity "$@"; }
+          sum() { curl -s "$1" | awk -v m="$2" 'index($1, m) == 1 {t += $2} END {printf "%d\n", t}'; }
+          # Telemetry and bundle uploads from site A's devices, and the site B gateway's forwarding.
+          failures() {
+            echo $(( $(sum localhost:9102/metrics connectivity_agent_send_failures_total) \
+                   + $(sum localhost:9102/metrics connectivity_agent_bundle_upload_failures_total) \
+                   + $(sum localhost:8090/metrics connectivity_gateway_forward_failures_total) ))
+          }
+          f0=$(failures)
+          k rollout restart deployment/ingest-api
+          k rollout status deployment/ingest-api --timeout=5m
+          sleep 15
+          f1=$(failures)
+          echo "device and gateway send failures during the rollout: $((f1 - f0))"
+          [ "$f1" -eq "$f0" ] || { echo "::error::devices saw $((f1 - f0)) failed sends during a rolling restart of the ingest API"; exit 1; }
+
+      - name: Service logs are in Loki, and Grafana reaches Loki and Tempo
+        run: |
+          lq() {
+            curl -fsS -G "localhost:3000/api/datasources/proxy/uid/loki/loki/api/v1/query" --data-urlencode "query=$1" \
+              | python3 -c 'import json,sys; r=json.load(sys.stdin)["data"]["result"]; print(int(float(r[0]["value"][1])) if r else 0)'
+          }
+          for app in ingest-api telemetry-processor case-service kafka; do
+            for _ in $(seq 1 24); do [ "$(lq "sum(count_over_time({app=\"$app\"}[1h]))")" -gt 0 ] && break; sleep 5; done
+            n=$(lq "sum(count_over_time({app=\"$app\"}[1h]))"); echo "log lines in Loki for $app: $n"
+            [ "$n" -gt 0 ] || { echo "::error::no logs from $app in Loki"; exit 1; }
+          done
+          info=$(lq 'sum(count_over_time({app="case-service", level="INFO"}[1h]))')
+          echo "case-service lines labelled level=INFO: $info"
+          [ "$info" -gt 0 ] || { echo "::error::service log levels are not being parsed into a label"; exit 1; }
+          [ "$(curl -fsS localhost:3000/api/datasources/proxy/uid/tempo/api/echo)" = echo ] || { echo "::error::Grafana cannot reach Tempo"; exit 1; }
+
+      - name: Every Prometheus target is up, including the edge, cAdvisor and the WAN
+        run: |
+          for i in $(seq 1 24); do
+            if curl -s localhost:9090/api/v1/targets | python3 -c '
+          import json, sys, collections
+          t = json.load(sys.stdin)["data"]["activeTargets"]
+          jobs = collections.Counter(x["labels"]["job"] for x in t)
+          down = [x["labels"]["job"] + "/" + x["labels"].get("pod", x["labels"]["instance"]) for x in t if x["health"] != "up"]
+          print(dict(jobs), "down:", down)
+          need = {"ingest-api": 2, "telemetry-processor": 2, "case-service": 2, "kafka": 1, "object-store": 1,
+                  "edge-agent": 2, "site-gateway": 1, "wan": 1, "cadvisor": 3, "kube-state-metrics": 1}
+          sys.exit(0 if not down and all(jobs[j] >= n for j, n in need.items()) else 1)'; then
+              break
+            fi
+            [ "$i" = 24 ] && { echo "::error::some Prometheus targets are missing or down"; exit 1; }
+            sleep 5
+          done
+          curl -s localhost:9090/api/v1/rules | python3 -c '
+          import json, sys
+          names = {r["name"] for g in json.load(sys.stdin)["data"]["groups"] for r in g["rules"]}
+          missing = {"KafkaBrokerMissing", "PodRestarting", "GatewayBacklog", "CaseServiceLag"} - names
+          print(len(names), "rules loaded; missing:", missing or "none")
+          sys.exit(1 if missing else 0)'
+
+      - name: "Chaos Mesh: kill a Kafka broker; it returns, catches up, and nothing is lost"
+        run: |
+          k() { kubectl --context k3d-connectivity -n connectivity "$@"; }
+          q() { ./scripts/cloud.sh sql "$1" 2>/dev/null || echo 0; }
+          urp() { ./scripts/cloud.sh kafka kafka-topics --describe --under-replicated-partitions 2>/dev/null | grep -c 'Topic:' || true; }
+          make chaos-install > /tmp/chaos-install.log 2>&1 || { tail -n 40 /tmp/chaos-install.log; echo "::error::Chaos Mesh did not install"; exit 1; }
+          uid0=$(k get pod kafka-1 -o jsonpath='{.metadata.uid}')
+          b0=$(q 'SELECT count(*) FROM ingested_batches')
+          k apply -f - <<'YAML'
+          apiVersion: chaos-mesh.org/v1alpha1
+          kind: PodChaos
+          metadata:
+            name: ci-kill-kafka-1
+          spec:
+            action: pod-kill
+            mode: all
+            selector:
+              pods:
+                connectivity: [kafka-1]
+          YAML
+          for _ in $(seq 1 30); do [ "$(k get pod kafka-1 -o jsonpath='{.metadata.uid}' 2>/dev/null)" != "$uid0" ] && break; sleep 2; done
+          [ "$(k get pod kafka-1 -o jsonpath='{.metadata.uid}' 2>/dev/null)" != "$uid0" ] || { echo "::error::Chaos Mesh did not kill kafka-1"; exit 1; }
+          echo "kafka-1 killed by Chaos Mesh at $(date +%T)"
+          k wait --for=condition=Ready pod/kafka-1 --timeout=5m
+          for _ in $(seq 1 36); do [ "$(urp)" = 0 ] && break; sleep 5; done
+          echo "under-replicated partitions after kafka-1 returned: $(urp)"
+          [ "$(urp)" = 0 ] || { echo "::error::partitions still under-replicated 3 minutes after kafka-1 came back"; exit 1; }
+          for _ in $(seq 1 24); do [ "$(q 'SELECT count(*) FROM ingested_batches')" -gt "$b0" ] && break; sleep 5; done
+          b1=$(q 'SELECT count(*) FROM ingested_batches')
+          dropped=$(curl -s localhost:9102/metrics localhost:9103/metrics | awk '/^connectivity_agent_samples_dropped_total/ {t += $2} END {printf "%d\n", t}')
+          echo "batches stored across the kill: $b0 -> $b1; samples dropped at the edge: $dropped"
+          [ "$b1" -gt "$b0" ] || { echo "::error::telemetry stopped after a single broker was killed"; exit 1; }
+          [ "$dropped" = 0 ] || { echo "::error::devices dropped $dropped samples"; exit 1; }
+          [ "$(q 'SELECT (SELECT coalesce(sum(sample_count),0) FROM ingested_batches) = (SELECT count(*) FROM telemetry)')" = t ] \
+            || { echo "::error::sample count does not match batch markers after the broker kill"; exit 1; }
+          echo "::notice title=broker kill::Chaos Mesh killed kafka-1; it rejoined, partitions were fully replicated again, $((b1 - b0)) batches stored meanwhile, none dropped"
+
+      - name: Diagnostics
+        if: failure()
+        run: |
+          k() { kubectl --context k3d-connectivity -n connectivity "$@"; }
+          enc() { sed -e ':a' -e 'N' -e '$!ba' -e 's/%/%25/g' -e 's/\r//g' -e 's/\n/%0A/g'; }
+          kubectl --context k3d-connectivity get nodes -o wide || true
+          k get pods -o wide || true
+          k get events --sort-by=.lastTimestamp | tail -n 40 || true
+          echo "::error title=pods::$(k get pods -o wide 2>&1 | enc)"
+          echo "::error title=events::$(k get events --sort-by=.lastTimestamp 2>&1 | tail -n 25 | enc)"
+          for p in $(k get pods --no-headers 2>/dev/null | awk '{split($2, r, "/")} r[1] != r[2] && $3 != "Completed" {print $1}'); do
+            echo "::error title=describe $p::$(k describe pod "$p" 2>&1 | tail -n 25 | enc)"
+            echo "::error title=logs $p::$(k logs "$p" --all-containers --tail=30 2>&1 | enc)"
+          done
+          COMPOSE_PROFILES='' docker compose ps -a || true
+          echo "::error title=edge::$(COMPOSE_PROFILES='' docker compose logs --no-color --tail=15 2>&1 | tail -n 40 | enc)"
+
+      - name: Tear down
+        if: always()
+        run: make cluster-down

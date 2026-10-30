@@ -1,1 +1,3 @@
 .env
+.mode
+k8s/.deploy/
