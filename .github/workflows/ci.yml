@@ -308,6 +308,8 @@ jobs:
       BUNDLE_INTERVAL: 20s
       BUNDLE_TRACE_BYTES: "262144"
       FAULT_RATE: "0"
+      # Trace every send, so the trace checks never wait on sampling luck.
+      TRACE_SAMPLE_RATIO: "1"
       K3D_VERSION: v5.9.0
     defaults:
       run:
@@ -461,6 +463,61 @@ jobs:
           echo "case-service lines labelled level=INFO: $info"
           [ "$info" -gt 0 ] || { echo "::error::service log levels are not being parsed into a label"; exit 1; }
           [ "$(curl -fsS localhost:3000/api/datasources/proxy/uid/tempo/api/echo)" = echo ] || { echo "::error::Grafana cannot reach Tempo"; exit 1; }
+
+      - name: "Traces: device to Postgres in one trace, through the gateway's disk queue, linked from the logs"
+        run: |
+          tempo="localhost:3000/api/datasources/proxy/uid/tempo"
+          # TraceQL search over the last hour; prints matching trace IDs.
+          tq() {
+            curl -fsS -G "$tempo/api/search" --data-urlencode "q=$1" --data-urlencode "limit=20" \
+              --data-urlencode "start=$(( $(date +%s) - 3600 ))" --data-urlencode "end=$(date +%s)" \
+              | python3 -c 'import json,sys; [print(t["traceID"]) for t in json.load(sys.stdin).get("traces") or []]'
+          }
+          # The services that took part in one trace.
+          services() {
+            curl -fsS -H 'Accept: application/json' "$tempo/api/traces/$1" | python3 -c '
+          import json, sys
+          d = json.load(sys.stdin)
+          batches = d.get("batches") or d.get("resourceSpans") or (d.get("trace") or {}).get("resourceSpans") or []
+          names = {a["value"].get("stringValue") for b in batches for a in b.get("resource", {}).get("attributes", []) if a["key"] == "service.name"}
+          print(" ".join(sorted(n for n in names if n)))'
+          }
+          # The first trace matching $1 whose services include all of $2.
+          find_trace() {
+            for _ in $(seq 1 24); do
+              for id in $(tq "$1"); do
+                have=" $(services "$id") "
+                missing=""
+                for want in $2; do [[ "$have" == *" $want "* ]] || missing="$missing $want"; done
+                [ -z "$missing" ] && { echo "$id"; return 0; }
+              done
+              sleep 5
+            done
+            return 1
+          }
+
+          id=$(find_trace '{ resource.service.name = "edge-agent" && resource.site.id = "site-a" } && { resource.service.name = "telemetry-processor" }' \
+            "edge-agent ingest-api telemetry-processor") \
+            || { echo "::error::no trace from a site A device through the ingest API to the processor"; exit 1; }
+          echo "site A: trace $id spans $(services "$id")"
+
+          id=$(find_trace '{ span.gateway.id = "site-b-gateway" } && { resource.service.name = "telemetry-processor" }' \
+            "edge-agent ingest-api telemetry-processor") \
+            || { echo "::error::no trace from a site B device through the gateway to the processor"; exit 1; }
+          echo "site B through the gateway: trace $id spans $(services "$id")"
+
+          # Records the gateway held during the WAN cut still carry the device's trace.
+          held=$(find_trace '{ span.gateway.queued_seconds > 5.0 }' "edge-agent ingest-api") \
+            || { echo "::error::no trace for a record the gateway held during the WAN cut still reaches back to the device"; exit 1; }
+          echo "held at the gateway: trace $held spans $(services "$held")"
+
+          # A log line about a case opening links to its trace.
+          linked=$(curl -fsS -G "localhost:3000/api/datasources/proxy/uid/loki/loki/api/v1/query" \
+            --data-urlencode 'query=sum(count_over_time({app="case-service"} |= "case opened" | trace_id != "" [1h]))' \
+            | python3 -c 'import json,sys; r=json.load(sys.stdin)["data"]["result"]; print(int(float(r[0]["value"][1])) if r else 0)')
+          echo "case-opened log lines with a trace_id: $linked"
+          [ "$linked" -gt 0 ] || { echo "::error::case service log lines carry no trace_id"; exit 1; }
+          echo "::notice title=traces::device to processor in one trace at both sites; a record held at the gateway kept its device trace ($held); $linked case logs link to traces"
 
       - name: Every Prometheus target is up, including the edge, cAdvisor and the WAN
         run: |

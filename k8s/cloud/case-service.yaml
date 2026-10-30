@@ -38,6 +38,9 @@ spec:
               valueFrom: { secretKeyRef: { name: connectivity, key: DATABASE_URL } }
             - { name: RULES_FILE, value: /etc/case-service/rules.json }
             - { name: LOG_LEVEL, value: info }
+            # Spans go to Tempo. The sampling decision is the device's
+            # (parent-based), so a trace is either whole or absent.
+            - { name: OTEL_EXPORTER_OTLP_ENDPOINT, value: "http://tempo:4318" }
           ports:
             - { name: http, containerPort: 8085 }
           readinessProbe:

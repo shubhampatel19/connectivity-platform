@@ -4,6 +4,8 @@ A mock edge-to-cloud telemetry system, built to break on purpose. Simulated fiel
 
 Both sites reach the cloud over a simulated WAN (Toxiproxy, one link per site) that you can slow down, starve, break or cut. The cloud runs in one of two modes: everything in Docker Compose (light, quick to start), or on a three-node Kubernetes cluster (k3d) with three Kafka brokers, Loki for logs and Chaos Mesh for failure injection.
 
+In cluster mode every service is traced with OpenTelemetry, and one trace follows a telemetry batch or an alert from the device, through the site gateway's disk queue and Kafka, to Postgres or the support case.
+
 This repo holds the local platform: the compose stack, the Kubernetes manifests, Prometheus, Grafana, Loki and Tempo config, alert rules, chaos experiments, and the workspace tooling that ties the component repos together.
 
 ```
@@ -125,7 +127,8 @@ What's different from compose mode:
 
 - **Kafka has three brokers** (KRaft, each also a controller), and every topic is replicated three ways with `min.insync.replicas=2`. One broker down is invisible to devices; two down and every produce fails.
 - **Services run two replicas** behind Kubernetes Services, with readiness and liveness probes, PodDisruptionBudgets and rolling updates. The processor and the case service share their consumer groups between replicas.
-- **Loki has every pod's logs**, shipped by Alloy, with the services' log level as a label and their JSON fields queryable. Tempo is running and wired into Grafana; the services start sending it traces in the next part of this phase.
+- **Loki has every pod's logs**, shipped by Alloy, with the services' log level as a label and their JSON fields queryable.
+- **Tempo has traces from end to end.** The edge agents, the ingest API, the processor and the case service export spans; the gateway carries each device's trace through its disk queue. Log lines written inside a trace carry its `trace_id`, and Grafana links logs and traces both ways.
 - **Kubernetes state is in Prometheus**: restarts and their reasons from kube-state-metrics, CPU, memory and throttling from cAdvisor, plus cluster-only alerts (`PodRestarting`, `ContainerOOMKilled`, `KafkaPartitionsBelowMinISR`, ...) in [`prometheus/alerts-k8s.yml`](prometheus/alerts-k8s.yml).
 - **Grafana has a second dashboard**, "Connectivity cluster": pods, Kafka replication, and logs.
 
@@ -144,6 +147,28 @@ kubectl --context k3d-connectivity -n connectivity get pods -o wide
 {app="telemetry-processor"} |= "retry"
 sum by (app, level) (count_over_time({namespace="connectivity"}[1m]))
 ```
+
+**Traces.** The agents trace one send in ten by default (`TRACE_SAMPLE_RATIO=1 make edge` for all of them), and the cloud follows each trace's decision, so a trace is either whole or absent. A telemetry trace looks like this:
+
+```
+edge-agent           send telemetry                      device.id, batch.id, buffer.samples
+ └ edge-agent        POST /v1/telemetry                  (through the gateway for site B)
+    └ ingest-api     POST /v1/telemetry                  gateway.id, gateway.queued_seconds
+       └ ingest-api  publish telemetry.raw               waits for acks=all
+          └ telemetry-processor  process telemetry.raw   outcome, retry events
+             └ telemetry-processor  postgres save batch
+```
+
+The gap between `publish` and `process` is the time the record sat in Kafka. In Grafana, Explore → Tempo takes TraceQL, and the cluster dashboard has a service graph, span rates and latencies, the records the gateway held longest, and failed traces:
+
+```
+{ resource.service.name = "edge-agent" && status = error }      sends that failed at the edge
+{ span.gateway.queued_seconds > 60.0 }                          records the gateway held over a minute
+{ span.outcome = "duplicate" }                                  retries and replays the store absorbed
+{ span.case.id = 12 }                                           the alert that opened case 12
+```
+
+TraceQL compares numbers by type, so a float attribute needs a float literal: `> 60.0` matches, `> 60` silently doesn't. Traced responses from the ingest API carry `X-Trace-ID`.
 
 **Chaos.** `make chaos-install` adds [Chaos Mesh](https://chaos-mesh.org) (dashboard on http://localhost:2333). The experiments are in [`k8s/chaos`](k8s/chaos), each with a comment saying what to expect:
 
@@ -223,6 +248,10 @@ Run `make chaos-install` first. Predict which alerts fire, in what order, before
 
 **23. Deploys and rollbacks.** CI proves that a rolling restart of the ingest API costs devices nothing. Find out why: remove the `preStop` sleep from [`k8s/cloud/ingest-api.yaml`](k8s/cloud/ingest-api.yaml), `make deploy`, then `kubectl --context k3d-connectivity -n connectivity rollout restart deployment/ingest-api` a few times while watching the edge send failure panel. Then make a visible change in the ingest API, `make deploy`, and roll it back with `kubectl rollout undo`.
 
+**24. Follow one record through an outage.** `make wan-down site=b` for 2 minutes, then `make wan-up site=b`. On the cluster dashboard, "Records the gateway held" lists the backlog. Open the longest: the device's send and the ingest API's span sit in one trace minutes apart, with `gateway.queued_seconds` on the ingest span. Then find the same batch in Postgres by its `batch.id`. Question to answer: the device's own send span is short and succeeded, yet the data arrived minutes later; what in the trace tells a support engineer the data was never at risk?
+
+**25. Find the slow hop.** Run drill 19 (`make chaos e=postgres-latency`) again, but start from the traces this time: the p95 span duration panel, then one slow trace. Which span grew, and which didn't? Repeat with `make chaos e=ingest-kafka-packet-loss` and compare where the time goes.
+
 ## Design decisions that matter during incidents
 
 - **Batch IDs are idempotency keys.** A device assigns `batch_id` once and reuses it on every retry. The processor records batch IDs in the same transaction as the samples, so retries and replays are absorbed instead of double-counted.
@@ -254,7 +283,7 @@ Run `make chaos-install` first. Predict which alerts fire, in what order, before
 2. **Phase 2 (done): log bundles.** Devices collect logs on a schedule and on thermal faults, spool them to disk, and upload them in resumable, checksummed chunks to an S3-compatible object store. The processor indexes them in Postgres.
 3. **Phase 3 (done): site gateway** (`connectivity-site-gateway`, Java 21). Device inventory, store-and-forward with a disk queue, a capped upstream connection pool, and JVM metrics. Site A runs direct, site B behind the gateway. CI takes the cloud down mid-run and checks that site B's data arrives with no gaps.
 4. **Phase 4 (done): alerts to cases** (`connectivity-case-service`). Devices raise alerts for thermal, PSU and disk faults; the gateway stores and forwards them; a rules engine opens cases with three layers of deduplication, including one site case for a storm; log bundles attach to their cases. CI injects faults and checks the exact cases that open, an alert carried through a cloud outage, and a full replay that changes nothing.
-5. **Phase 5 (in progress): production platform.** Done: cluster mode on k3d (three Kafka brokers, replicated services, probes, disruption budgets, commit-tagged rolling deploys), Toxiproxy on each site's WAN link in both modes, Chaos Mesh with eight experiments, Loki with every pod's logs, Kubernetes metrics and alerts. CI runs the whole system on k3d: a WAN cut at one site, a rolling deploy, and a broker killed by Chaos Mesh, each checked for data loss. Next: OpenTelemetry tracing in every service, from the device through the gateway's disk queue and Kafka to Postgres, into Tempo.
+5. **Phase 5 (done): production platform.** Cluster mode on k3d: three Kafka brokers, replicated services with probes and disruption budgets, commit-tagged rolling deploys. Toxiproxy on each site's WAN link in both modes. Chaos Mesh with eight experiments. Loki with every pod's logs, Kubernetes metrics and alerts, and OpenTelemetry tracing in every service into Tempo, with the device's trace carried through the gateway's disk queue and Kafka. CI runs the whole system on k3d and checks a WAN cut at one site, a rolling deploy, a broker killed by Chaos Mesh, and whole traces from both sites.
 6. **AI triage** (`connectivity-ai-triage`). LLM summaries of the log bundle attached to each case, RAG over runbooks, and an eval suite.
 
 After Phase 6: sealed bug drills, where a script applies a bug you haven't seen and you find it.

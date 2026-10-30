@@ -199,6 +199,12 @@ services:
       INGEST_URL: http://wan:18080
       ENROLLMENT_KEY: ${ENROLLMENT_KEY:-dev-enrollment-key}
       SITE_ID: site-a
+      # Cluster mode sets EDGE_OTLP_ENDPOINT (Tempo on host port 4318); empty
+      # means no span export, though trace context is still sent.
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${EDGE_OTLP_ENDPOINT:-}
+      OTEL_TRACES_SAMPLER: parentbased_traceidratio
+      OTEL_TRACES_SAMPLER_ARG: ${TRACE_SAMPLE_RATIO:-0.1}
+      OTEL_RESOURCE_ATTRIBUTES: site.id=site-a
       DEVICE_COUNT: ${DEVICE_COUNT:-200}
       SEND_INTERVAL: ${SEND_INTERVAL:-5s}
       BUNDLE_INTERVAL: ${BUNDLE_INTERVAL:-30m}
@@ -207,6 +213,8 @@ services:
       LOG_LEVEL: ${AGENT_LOG_LEVEL:-info}
     ports:
       - "9102:9102"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     depends_on:
       - wan
     restart: unless-stopped
@@ -238,6 +246,12 @@ services:
       INGEST_URL: http://site-gateway:8090
       ENROLLMENT_KEY: ${ENROLLMENT_KEY:-dev-enrollment-key}
       SITE_ID: site-b
+      # Cluster mode sets EDGE_OTLP_ENDPOINT (Tempo on host port 4318); empty
+      # means no span export, though trace context is still sent.
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${EDGE_OTLP_ENDPOINT:-}
+      OTEL_TRACES_SAMPLER: parentbased_traceidratio
+      OTEL_TRACES_SAMPLER_ARG: ${TRACE_SAMPLE_RATIO:-0.1}
+      OTEL_RESOURCE_ATTRIBUTES: site.id=site-b
       DEVICE_COUNT: ${SITE_B_DEVICE_COUNT:-100}
       SEND_INTERVAL: ${SEND_INTERVAL:-5s}
       BUNDLE_INTERVAL: ${BUNDLE_INTERVAL:-30m}
@@ -246,6 +260,8 @@ services:
       LOG_LEVEL: ${AGENT_LOG_LEVEL:-info}
     ports:
       - "9103:9102"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     depends_on:
       - site-gateway
     restart: unless-stopped

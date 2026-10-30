@@ -90,8 +90,9 @@ YAML
 
 edge() {
   need docker
-  echo "==> start the edge and the WAN (Docker Compose, cloud via host port 8080)"
-  WAN_UPSTREAM=host.docker.internal:8080 COMPOSE_PROFILES='' docker compose up -d --build
+  echo "==> start the edge and the WAN (Docker Compose, cloud via host port 8080, spans to Tempo on 4318)"
+  WAN_UPSTREAM=host.docker.internal:8080 EDGE_OTLP_ENDPOINT=http://host.docker.internal:4318 \
+    COMPOSE_PROFILES='' docker compose up -d --build
 }
 
 up() {
@@ -110,7 +111,7 @@ up() {
   cat <<TXT
 
 Cluster mode is up. kubectl --context $CONTEXT -n $NS get pods
-  Grafana      http://localhost:3000   (Connectivity overview, Connectivity cluster)
+  Grafana      http://localhost:3000   (Connectivity overview, Connectivity cluster; Explore for Loki and Tempo)
   Prometheus   http://localhost:9090
   Ingest API   http://localhost:8080   (via Traefik; devices go through the WAN proxy)
   Case API     http://localhost:8085   (make cases)

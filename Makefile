@@ -22,6 +22,7 @@ KUBECTL   := kubectl --context k3d-connectivity -n connectivity
 ifeq ($(MODE),cluster)
 export COMPOSE_PROFILES :=
 export WAN_UPSTREAM := host.docker.internal:8080
+export EDGE_OTLP_ENDPOINT := http://host.docker.internal:4318
 else
 export COMPOSE_PROFILES := cloud
 endif

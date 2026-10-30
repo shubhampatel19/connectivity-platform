@@ -8,6 +8,7 @@
 #   8080 ingest API (Traefik ingress, the cloud's public front door)
 #   8085 case service API   3000 Grafana   9090 Prometheus
 #   8888 object store filer 2333 Chaos Mesh dashboard (after `make chaos-install`)
+#   4318 Tempo's OTLP endpoint, where the edge agents send their spans
 apiVersion: k3d.io/v1alpha5
 kind: Simple
 metadata:
@@ -27,6 +28,8 @@ ports:
   - port: 8888:30888
     nodeFilters: [loadbalancer]
   - port: 2333:30233
+    nodeFilters: [loadbalancer]
+  - port: 4318:30418
     nodeFilters: [loadbalancer]
 options:
   k3d:

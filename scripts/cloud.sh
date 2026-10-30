@@ -22,7 +22,7 @@ EDGE=" edge-agent edge-agent-site-b site-gateway wan "
 
 compose() {
   if [ "$MODE" = cluster ]; then
-    COMPOSE_PROFILES='' WAN_UPSTREAM=host.docker.internal:8080 docker compose "$@"
+    COMPOSE_PROFILES='' WAN_UPSTREAM=host.docker.internal:8080 EDGE_OTLP_ENDPOINT=http://host.docker.internal:4318 docker compose "$@"
   else
     COMPOSE_PROFILES=cloud docker compose "$@"
   fi

@@ -34,6 +34,9 @@ spec:
             - name: DATABASE_URL
               valueFrom: { secretKeyRef: { name: connectivity, key: DATABASE_URL } }
             - { name: LOG_LEVEL, value: info }
+            # Spans go to Tempo. The sampling decision is the device's
+            # (parent-based), so a trace is either whole or absent.
+            - { name: OTEL_EXPORTER_OTLP_ENDPOINT, value: "http://tempo:4318" }
           ports:
             - { name: metrics, containerPort: 9101 }
           # The processor only serves metrics, so liveness can only say the
