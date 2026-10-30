@@ -491,10 +491,11 @@ jobs:
           k() { kubectl --context k3d-connectivity -n connectivity "$@"; }
           q() { ./scripts/cloud.sh sql "$1" 2>/dev/null || echo 0; }
           urp() { ./scripts/cloud.sh kafka kafka-topics --describe --under-replicated-partitions 2>/dev/null | grep -c 'Topic:' || true; }
-          make chaos-install > /tmp/chaos-install.log 2>&1 || { tail -n 40 /tmp/chaos-install.log; echo "::error::Chaos Mesh did not install"; exit 1; }
+          make chaos-install > /tmp/chaos-install.log 2>&1 || { tail -n 40 /tmp/chaos-install.log; echo "::error title=Chaos Mesh did not install::$(tail -n 20 /tmp/chaos-install.log | tr '\n' ' ')"; exit 1; }
+          kubectl --context k3d-connectivity -n chaos-mesh get pods
           uid0=$(k get pod kafka-1 -o jsonpath='{.metadata.uid}')
           b0=$(q 'SELECT count(*) FROM ingested_batches')
-          k apply -f - <<'YAML'
+          cat > /tmp/kill-kafka-1.yaml <<'YAML'
           apiVersion: chaos-mesh.org/v1alpha1
           kind: PodChaos
           metadata:
@@ -506,6 +507,10 @@ jobs:
               pods:
                 connectivity: [kafka-1]
           YAML
+          # Chaos Mesh's admission webhook can lag a little behind helm --wait.
+          for _ in $(seq 1 12); do k apply -f /tmp/kill-kafka-1.yaml > /tmp/apply.log 2>&1 && break; sleep 10; done
+          grep -q "ci-kill-kafka-1" /tmp/apply.log && ! grep -qi error /tmp/apply.log \
+            || { echo "::error title=PodChaos not accepted::$(tr '\n' ' ' < /tmp/apply.log)"; exit 1; }
           for _ in $(seq 1 30); do [ "$(k get pod kafka-1 -o jsonpath='{.metadata.uid}' 2>/dev/null)" != "$uid0" ] && break; sleep 2; done
           [ "$(k get pod kafka-1 -o jsonpath='{.metadata.uid}' 2>/dev/null)" != "$uid0" ] || { echo "::error::Chaos Mesh did not kill kafka-1"; exit 1; }
           echo "kafka-1 killed by Chaos Mesh at $(date +%T)"
