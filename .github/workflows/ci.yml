@@ -343,13 +343,18 @@ jobs:
 
       - name: Three brokers, every partition fully replicated
         run: |
-          brokers=$(./scripts/cloud.sh kafka kafka-broker-api-versions 2>/dev/null | grep -c '^kafka-')
-          urp=$(./scripts/cloud.sh kafka kafka-topics --describe --under-replicated-partitions | grep -c 'Topic:' || true)
-          rf=$(./scripts/cloud.sh kafka kafka-topics --describe --topic telemetry.raw | grep -o 'ReplicationFactor: [0-9]*' | head -1)
+          enc() { sed -e ':a' -e 'N' -e '$!ba' -e 's/%/%25/g' -e 's/\r//g' -e 's/\n/%0A/g'; }
+          fail() { echo "::error title=$1::$(head -c 3000 "$2" | enc)"; exit 1; }
+          ./scripts/cloud.sh kafka kafka-broker-api-versions > /tmp/brokers.txt 2>&1 || true
+          ./scripts/cloud.sh kafka kafka-topics --describe > /tmp/topics.txt 2>&1 || true
+          ./scripts/cloud.sh kafka kafka-topics --describe --under-replicated-partitions > /tmp/urp.txt 2>&1 || true
+          brokers=$(grep -c '^kafka-' /tmp/brokers.txt || true)
+          rf=$(awk -F'\t' '$1 == "Topic: telemetry.raw" { for (i = 1; i <= NF; i++) if ($i ~ /^ReplicationFactor:/) print $i }' /tmp/topics.txt)
+          urp=$(grep -c 'Topic:' /tmp/urp.txt || true)
           echo "brokers: $brokers; telemetry.raw $rf; under-replicated partitions: $urp"
-          [ "$brokers" = 3 ] || { echo "::error::expected 3 brokers, found $brokers"; exit 1; }
-          [ "$rf" = "ReplicationFactor: 3" ] || { echo "::error::telemetry.raw is not replicated 3 ways ($rf)"; exit 1; }
-          [ "$urp" = 0 ] || { echo "::error::$urp partitions are under-replicated on a fresh cluster"; exit 1; }
+          [ "$brokers" = 3 ] || fail "expected 3 brokers, found $brokers" /tmp/brokers.txt
+          [ "$rf" = "ReplicationFactor: 3" ] || fail "telemetry.raw is not replicated 3 ways" /tmp/topics.txt
+          [ "$urp" = 0 ] || fail "$urp partitions are under-replicated on a fresh cluster" /tmp/urp.txt
           kubectl --context k3d-connectivity -n connectivity get pods -l app=kafka -o wide
 
       - name: Telemetry from both sites reaches Postgres, through the WAN and the ingress

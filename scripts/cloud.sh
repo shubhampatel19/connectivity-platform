@@ -35,7 +35,7 @@ tty() { if [ -t 0 ] && [ -t 1 ]; then echo "-it"; else echo "-i"; fi; }
 broker() {
   k get pods -l app=kafka --no-headers \
     -o custom-columns='NAME:.metadata.name,READY:.status.containerStatuses[0].ready' \
-    | awk '$2 == "true" {print $1; exit}'
+    | awk '$2 == "true" && !found {print $1; found = 1}'
 }
 
 # deployment/x or statefulset/x for a service name.
