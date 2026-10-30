@@ -509,8 +509,17 @@ jobs:
           YAML
           # Chaos Mesh's admission webhook can lag a little behind helm --wait.
           for _ in $(seq 1 12); do k apply -f /tmp/kill-kafka-1.yaml > /tmp/apply.log 2>&1 && break; sleep 10; done
-          grep -q "ci-kill-kafka-1" /tmp/apply.log && ! grep -qi error /tmp/apply.log \
-            || { echo "::error title=PodChaos not accepted::$(tr '\n' ' ' < /tmp/apply.log)"; exit 1; }
+          if ! grep -q "ci-kill-kafka-1" /tmp/apply.log || grep -qi error /tmp/apply.log; then
+            cm() { kubectl --context k3d-connectivity -n chaos-mesh "$@" 2>&1; }
+            enc() { sed -e ':a' -e 'N' -e '$!ba' -e 's/%/%25/g' -e 's/\r//g' -e 's/\n/%0A/g'; }
+            echo "::error title=PodChaos not accepted::$(tr '\n' ' ' < /tmp/apply.log)"
+            echo "::error title=chaos-mesh pods::$(cm get pods -o wide | enc)"
+            echo "::error title=chaos-mesh endpoints::$(cm get endpoints | enc)"
+            echo "::error title=controller-manager describe::$(cm describe pod -l app.kubernetes.io/component=controller-manager | tail -n 40 | enc)"
+            echo "::error title=controller-manager logs::$(cm logs -l app.kubernetes.io/component=controller-manager --tail=40 | enc)"
+            echo "::error title=controller-manager previous logs::$(cm logs -l app.kubernetes.io/component=controller-manager --previous --tail=40 | enc)"
+            exit 1
+          fi
           for _ in $(seq 1 30); do [ "$(k get pod kafka-1 -o jsonpath='{.metadata.uid}' 2>/dev/null)" != "$uid0" ] && break; sleep 2; done
           [ "$(k get pod kafka-1 -o jsonpath='{.metadata.uid}' 2>/dev/null)" != "$uid0" ] || { echo "::error::Chaos Mesh did not kill kafka-1"; exit 1; }
           echo "kafka-1 killed by Chaos Mesh at $(date +%T)"
