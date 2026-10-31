@@ -18,7 +18,7 @@ CLUSTER=connectivity
 CONTEXT="k3d-$CLUSTER"
 NS=connectivity
 WORKSPACE=..
-CLOUD_SERVICES=(ingest-api telemetry-processor case-service)
+CLOUD_SERVICES=(ingest-api telemetry-processor case-service ai-triage)
 CHAOS_MESH_VERSION=2.8.4
 
 k() { kubectl --context "$CONTEXT" -n "$NS" "$@"; }
@@ -70,6 +70,18 @@ YAML
 
   echo "==> import images into the cluster's nodes"
   k3d image import --cluster "$CLUSTER" "${images[@]}"
+
+  # The Claude API key, from your environment, never from a file in the repo.
+  # Without one, AI triage runs on its fake model.
+  k create namespace "$NS" --dry-run=client -o yaml | kubectl --context "$CONTEXT" apply -f - > /dev/null
+  if [ -n "${ANTHROPIC_API_KEY:-}" ]; then
+    k create secret generic ai-triage --from-literal=ANTHROPIC_API_KEY="$ANTHROPIC_API_KEY" \
+      --dry-run=client -o yaml | k apply -f - > /dev/null
+    echo "==> AI triage will use Claude (ANTHROPIC_API_KEY is set)"
+  else
+    k delete secret ai-triage --ignore-not-found > /dev/null
+    echo "==> AI triage will use its fake model (set ANTHROPIC_API_KEY to use Claude)"
+  fi
 
   echo "==> apply manifests"
   # The topic Job is rerun on every deploy (it is idempotent); a finished Job

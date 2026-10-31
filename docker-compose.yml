@@ -78,7 +78,10 @@ services:
 
   postgres:
     profiles: [cloud]
-    image: postgres:16-alpine
+    # Postgres 16 with pgvector, for AI triage's runbook embeddings. (Debian-
+    # based, unlike the old postgres:16-alpine: a pg-data volume from before
+    # Phase 6 needs `make down` once.)
+    image: pgvector/pgvector:0.8.0-pg16
     environment:
       POSTGRES_USER: connectivity
       POSTGRES_PASSWORD: connectivity
@@ -86,8 +89,8 @@ services:
     ports:
       - "5432:5432"
     volumes:
-      # The telemetry processor and the case service each create and migrate
-      # their own tables on startup (the case service's live in schema "cases").
+      # The telemetry processor, the case service and AI triage each create and
+      # migrate their own tables on startup (schemas "cases" and "triage").
       - pg-data:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U connectivity -d connectivity"]
@@ -171,6 +174,40 @@ services:
     depends_on:
       kafka-init: { condition: service_completed_successfully }
       postgres: { condition: service_healthy }
+    restart: unless-stopped
+
+  # ---------- AI triage ----------
+  # Writes a triage note for every case once its logs arrive. Uses Claude when
+  # ANTHROPIC_API_KEY is set, Ollama when OLLAMA_URL is (on the host:
+  # http://host.docker.internal:11434), and otherwise a deterministic fake
+  # model, so the stack runs with no key and drills can break the model.
+  ai-triage:
+    profiles: [cloud]
+    build: ../connectivity-ai-triage
+    image: connectivity/ai-triage:dev
+    environment:
+      DATABASE_URL: postgresql://connectivity:connectivity@postgres:5432/connectivity
+      CASES_URL: http://case-service:8085
+      S3_ENDPOINT: object-store:8333
+      S3_ACCESS_KEY: ${S3_ACCESS_KEY:-connectivity}
+      S3_SECRET_KEY: ${S3_SECRET_KEY:-connectivity-secret}
+      S3_BUCKET: log-bundles
+      LLM_PROVIDER: ${LLM_PROVIDER:-auto}
+      LLM_MODEL: ${LLM_MODEL:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      OLLAMA_URL: ${OLLAMA_URL:-}
+      DAILY_BUDGET_USD: ${TRIAGE_BUDGET_USD:-2}
+      FAKE_LLM_FAULTS: ${FAKE_LLM_FAULTS:-}
+      POLL_INTERVAL: ${TRIAGE_POLL_INTERVAL:-10}
+      LOG_LEVEL: ${TRIAGE_LOG_LEVEL:-info}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "8086:8086"
+    depends_on:
+      postgres: { condition: service_healthy }
+      # Started, not healthy: notes wait for the case API, they don't block on it.
+      case-service: { condition: service_started }
     restart: unless-stopped
 
   # ---------- the WAN between the sites and the cloud ----------

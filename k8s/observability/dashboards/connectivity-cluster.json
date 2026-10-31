@@ -877,7 +877,7 @@
             "type": "loki",
             "uid": "loki"
           },
-          "expr": "sum by (app, level) (count_over_time({namespace=\"connectivity\", app=~\"ingest-api|telemetry-processor|case-service\"} [1m]))",
+          "expr": "sum by (app, level) (count_over_time({namespace=\"connectivity\", app=~\"ingest-api|telemetry-processor|case-service|ai-triage\"} [1m]))",
           "legendFormat": "{{app}} {{level}}"
         }
       ]

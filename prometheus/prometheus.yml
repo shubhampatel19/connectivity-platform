@@ -15,6 +15,9 @@ scrape_configs:
   - job_name: case-service
     static_configs:
       - targets: ["case-service:8085"]
+  - job_name: ai-triage
+    static_configs:
+      - targets: ["ai-triage:8086"]
   # One job for both sites, so fleet-wide queries keep working; split by site.
   - job_name: edge-agent
     static_configs:

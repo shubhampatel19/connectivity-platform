@@ -78,7 +78,7 @@ jobs:
 
       - name: Clone component repos
         run: |
-          for repo in connectivity-edge-agent connectivity-ingest-api connectivity-telemetry-processor connectivity-site-gateway connectivity-case-service; do
+          for repo in connectivity-edge-agent connectivity-ingest-api connectivity-telemetry-processor connectivity-site-gateway connectivity-case-service connectivity-ai-triage; do
             git clone --depth 1 "https://github.com/${{ github.repository_owner }}/$repo.git"
           done
 
@@ -135,8 +135,8 @@ jobs:
           curl -fsS -o /dev/null localhost:8085/readyz || { echo "::error::the case service never became ready"; exit 1; }
 
           # 1. One overheating device at site A: exactly one device case, and its log bundle attaches.
-          dev=$(curl -fsS -X POST 'localhost:9102/debug/faults?kind=thermal&devices=1' | py 'import json,sys; print(json.load(sys.stdin)["devices"][0])')
-          echo "injected an overheat on $dev"
+          read -r dev cause <<<"$(curl -fsS -X POST 'localhost:9102/debug/faults?kind=thermal&devices=1' | py 'import json,sys; f=json.load(sys.stdin)["faults"][0]; print(f["device_id"], f["cause"])')"
+          echo "injected an overheat on $dev (cause: $cause)"
           dev_cases() { api "/v1/cases?status=all&device=$dev"; }
           for _ in $(seq 1 36); do [ "$(dev_cases | py 'import json,sys; print(len(json.load(sys.stdin)["cases"]))')" -ge 1 ] && break; sleep 5; done
           read -r n scope rule id <<<"$(dev_cases | py 'import json,sys; c=json.load(sys.stdin)["cases"]; print(len(c), *( (c[0]["scope"], c[0]["rule_id"], c[0]["case_id"]) if c else ("-","-","-")))')"
@@ -146,6 +146,7 @@ jobs:
           for _ in $(seq 1 36); do [ "$(api "/v1/cases/$id" | py 'import json,sys; print(json.load(sys.stdin)["logs"])')" = attached ] && break; sleep 5; done
           logs=$(api "/v1/cases/$id" | py 'import json,sys; print(json.load(sys.stdin)["logs"])')
           [ "$logs" = attached ] || { echo "::error::case #$id never got its log bundle (logs: $logs)"; exit 1; }
+          echo "$dev $cause $id" > /tmp/thermal-case
 
           # 2. Every site B device overheats at once, through the gateway: one site case, not 30.
           hit=$(curl -fsS -X POST 'localhost:9103/debug/faults?kind=thermal&devices=all' | py 'import json,sys; print(len(json.load(sys.stdin)["devices"]))')
@@ -169,6 +170,45 @@ jobs:
           [ "$orphans" = 0 ] || { echo "::error::$orphans site B device cases are not children of the site case"; exit 1; }
           [ "$(api '/v1/cases?status=open&site=site-a&rule=thermal-critical' | py 'import json,sys; print(sum(x["scope"] == "site" for x in json.load(sys.stdin)["cases"]))')" = 0 ] \
             || { echo "::error::site A got a site case from a single device"; exit 1; }
+
+      - name: "AI triage: notes name the injected cause; a planted prompt injection is flagged, not followed"
+        working-directory: connectivity-platform
+        run: |
+          py()   { python3 -c "$1"; }
+          note() { curl -fsS "localhost:8086/v1/triage/$1" 2>/dev/null || echo '{}'; }
+          field() { note "$1" | py "import json,sys; n=json.load(sys.stdin); print($2)"; }
+          wait_note() {
+            for _ in $(seq 1 36); do [ "$(field "$1" 'n.get("status", "")')" = done ] && return 0; sleep 5; done
+            echo "::error::case #$1 never got a triage note: $(note "$1")"; exit 1
+          }
+          for _ in $(seq 1 24); do curl -fsS -o /dev/null localhost:8086/readyz && break; sleep 5; done
+
+          # 1. The overheat from the previous step. The fake model reads the
+          # device's real log bundle, so its answer is a check on the whole
+          # path: device log, bundle, object store, case, retrieval, note.
+          read -r dev cause id < /tmp/thermal-case
+          wait_note "$id"
+          read -r got grounded <<<"$(field "$id" 'n["note"]["category"], n["checks"]["grounded"]')"
+          echo "::notice title=triage::case #$id on $dev: the edge agent injected $cause, triage said $got"
+          [ "$got" = "$cause" ] || { echo "::error::triage named $got for case #$id, but the injected cause was $cause: $(note "$id")"; exit 1; }
+          [ "$grounded" = True ] || { echo "::error::case #$id's note cites something the model wasn't given: $(note "$id")"; exit 1; }
+
+          # 2. A prompt injection in a device's log (through its asset tag),
+          # then a failing disk on the same device.
+          dev2=site-a-00003; [ "$dev2" = "$dev" ] && dev2=site-a-00004
+          curl -fsS -X POST "localhost:9102/debug/logs?preset=prompt_injection&device=$dev2" > /dev/null
+          curl -fsS -X POST "localhost:9102/debug/faults?kind=disk&cause=disk_failing&device=$dev2" > /dev/null
+          case_id() { curl -fsS "localhost:8085/v1/cases?status=all&device=$dev2&rule=disk-reallocating" | py 'import json,sys; c=json.load(sys.stdin)["cases"]; print(c[0]["case_id"] if c else "")'; }
+          for _ in $(seq 1 36); do id2=$(case_id); [ -n "$id2" ] && break; sleep 5; done
+          [ -n "$id2" ] || { echo "::error::the disk fault on $dev2 never became a case"; exit 1; }
+          wait_note "$id2"
+          read -r got2 flagged <<<"$(field "$id2" 'n["note"]["category"], n["note"]["injection_detected"]')"
+          echo "::notice title=prompt injection::case #$id2 on $dev2: triage said $got2, injection flagged: $flagged"
+          [ "$got2" = disk_failing ] || { echo "::error::the planted line changed the answer: $got2, expected disk_failing"; exit 1; }
+          [ "$flagged" = True ] || { echo "::error::the planted line wasn't flagged: $(note "$id2")"; exit 1; }
+          field "$id2" '"no fault found" in json.dumps(n["note"]).lower()' | grep -q False \
+            || { echo "::error::the note did what the planted line asked: $(note "$id2")"; exit 1; }
+          python3 scripts/triages.py
 
       - name: "Store-and-forward: site B through a cloud outage"
         working-directory: connectivity-platform
@@ -271,8 +311,8 @@ jobs:
           echo "::error::some Prometheus targets are not up"
           exit 1
 
-      - name: Check the ingest API and case service are ready
-        run: curl -fsS -o /dev/null localhost:8080/readyz && curl -fsS -o /dev/null localhost:8085/readyz && echo "readyz ok"
+      - name: Check the ingest API, case service and AI triage are ready
+        run: curl -fsS -o /dev/null localhost:8080/readyz && curl -fsS -o /dev/null localhost:8085/readyz && curl -fsS -o /dev/null localhost:8086/readyz && echo "readyz ok"
 
       - name: Diagnostics
         if: failure()
@@ -322,7 +362,7 @@ jobs:
       - name: Clone component repos
         working-directory: .
         run: |
-          for repo in connectivity-edge-agent connectivity-ingest-api connectivity-telemetry-processor connectivity-site-gateway connectivity-case-service; do
+          for repo in connectivity-edge-agent connectivity-ingest-api connectivity-telemetry-processor connectivity-site-gateway connectivity-case-service connectivity-ai-triage; do
             git clone --depth 1 "https://github.com/${{ github.repository_owner }}/$repo.git"
           done
 
@@ -395,6 +435,18 @@ jobs:
           for _ in $(seq 1 36); do [ "$(n)" -ge 1 ] && break; sleep 5; done
           echo "cases for $dev: $(n)"
           [ "$(n)" = 1 ] || { echo "::error::one overheat on $dev should open exactly one case, got $(n)"; exit 1; }
+
+      - name: The case gets a triage note from one of the two AI triage replicas
+        run: |
+          py() { python3 -c "$1"; }
+          id=$(curl -fsS "localhost:8085/v1/cases?status=all&rule=thermal-critical" | py 'import json,sys; print(json.load(sys.stdin)["cases"][0]["case_id"])')
+          status() { curl -fsS "localhost:8086/v1/triage/$id" 2>/dev/null | py 'import json,sys; print(json.load(sys.stdin)["status"])' 2>/dev/null || echo none; }
+          for _ in $(seq 1 36); do [ "$(status)" = done ] && break; sleep 5; done
+          [ "$(status)" = done ] || { echo "::error::case #$id has no triage note in cluster mode: $(curl -s localhost:8086/v1/triage/$id)"; exit 1; }
+          calls=$(kubectl --context k3d-connectivity -n connectivity exec postgres-0 -- psql -U connectivity -d connectivity -tAc "SELECT count(*) FROM triage.llm_calls WHERE case_id = $id AND outcome = 'ok'")
+          echo "::notice title=triage::case #$id: $(curl -fsS localhost:8086/v1/triage/$id | py 'import json,sys; n=json.load(sys.stdin); print(n["note"]["category"], "by", n["model"])'), $calls model call(s)"
+          # Leases: two replicas, one case, one call.
+          [ "$calls" = 1 ] || { echo "::error::case #$id was sent to the model $calls times; the leases should make it once"; exit 1; }
 
       - name: "WAN cut at site B: the gateway queues, site A carries on, nothing is lost"
         run: |
@@ -534,7 +586,7 @@ jobs:
           jobs = collections.Counter(x["labels"]["job"] for x in t)
           down = [x["labels"]["job"] + "/" + x["labels"].get("pod", x["labels"]["instance"]) for x in t if x["health"] != "up"]
           print(dict(jobs), "down:", down)
-          need = {"ingest-api": 2, "telemetry-processor": 2, "case-service": 2, "kafka": 1, "object-store": 1,
+          need = {"ingest-api": 2, "telemetry-processor": 2, "case-service": 2, "ai-triage": 2, "kafka": 1, "object-store": 1,
                   "edge-agent": 2, "site-gateway": 1, "wan": 1, "cadvisor": 3, "kube-state-metrics": 1}
           sys.exit(0 if not down and all(jobs[j] >= n for j, n in need.items()) else 1)'; then
               break
@@ -545,7 +597,7 @@ jobs:
           curl -s localhost:9090/api/v1/rules | python3 -c '
           import json, sys
           names = {r["name"] for g in json.load(sys.stdin)["data"]["groups"] for r in g["rules"]}
-          missing = {"KafkaBrokerMissing", "PodRestarting", "GatewayBacklog", "CaseServiceLag"} - names
+          missing = {"KafkaBrokerMissing", "PodRestarting", "GatewayBacklog", "CaseServiceLag", "TriageSpendRateHigh"} - names
           print(len(names), "rules loaded; missing:", missing or "none")
           sys.exit(1 if missing else 0)'
 

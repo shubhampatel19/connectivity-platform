@@ -29,7 +29,8 @@ spec:
       terminationGracePeriodSeconds: 30
       containers:
         - name: postgres
-          image: postgres:16-alpine
+          # Postgres 16 with pgvector, for AI triage's runbook embeddings.
+          image: pgvector/pgvector:0.8.0-pg16
           env:
             - { name: POSTGRES_USER, value: connectivity }
             - { name: POSTGRES_DB, value: connectivity }

@@ -6,6 +6,8 @@ Both sites reach the cloud over a simulated WAN (Toxiproxy, one link per site) t
 
 In cluster mode every service is traced with OpenTelemetry, and one trace follows a telemetry batch or an alert from the device, through the site gateway's disk queue and Kafka, to Postgres or the support case.
 
+Every case then gets a triage note from an LLM: the likely root cause, the log lines that show it, the runbooks that apply, checked so that it can only cite what the model was really given. The simulated devices know the true cause of every fault they raise, so the notes can be graded against the truth, live and in an eval suite.
+
 This repo holds the local platform: the compose stack, the Kubernetes manifests, Prometheus, Grafana, Loki and Tempo config, alert rules, chaos experiments, and the workspace tooling that ties the component repos together.
 
 ```
@@ -26,6 +28,8 @@ This repo holds the local platform: the compose stack, the Kubernetes manifests,
         └──────────────────── Prometheus scrapes everything ──── Grafana dashboard + alert rules ────────────┘
 ```
 
+AI triage sits beside the case service: it polls the case API for cases whose logs have arrived, reads their bundles from SeaweedFS, retrieves runbooks from pgvector, asks the model, and keeps its notes in schema `triage`, served on `/v1/triage`.
+
 ## Repositories
 
 | Repo | Role | Depends on |
@@ -38,6 +42,7 @@ This repo holds the local platform: the compose stack, the Kubernetes manifests,
 | [connectivity-telemetry-processor](https://github.com/shubhampatel19/connectivity-telemetry-processor) | Kafka consumer writing to Postgres; owns the DB schema | contracts, go-kit |
 | [connectivity-site-gateway](https://github.com/shubhampatel19/connectivity-site-gateway) | On-site gateway (Java 21): store-and-forward, device inventory, cloud proxy | the `/v1` API |
 | [connectivity-case-service](https://github.com/shubhampatel19/connectivity-case-service) | Device alerts to support cases: rules, deduplication, case API; owns schema `cases` | contracts, go-kit |
+| [connectivity-ai-triage](https://github.com/shubhampatel19/connectivity-ai-triage) | A triage note for every case (Python): evidence from the log bundle, runbook retrieval, Claude or a fake model, grounding checks, evals; owns schema `triage` | the case API, the object store |
 
 The Go services pin `contracts` and `go-kit` by version, the way independently deployed components do in a real fleet. For day-to-day work, the bootstrap script creates a `go.work` file so you can change a shared module and a service together, then release the shared module first.
 
@@ -51,7 +56,7 @@ git clone https://github.com/shubhampatel19/connectivity-platform.git
 cd connectivity-platform
 make bootstrap   # clones the other repos next to this one, creates ../go.work
 make test        # unit tests with the race detector, every module
-make up          # compose mode: builds images and starts 14 containers
+make up          # compose mode: builds images and starts 15 containers
 ```
 
 After about a minute:
@@ -64,6 +69,7 @@ After about a minute:
 | Site gateway | http://localhost:8090/gateway/v1/devices (site B inventory), `/metrics`; or `make devices` and `make gateway` |
 | Telemetry processor metrics | http://localhost:9101/metrics |
 | Case service | http://localhost:8085/v1/cases, `/metrics`; or `make cases`, `make case id=N`, `make rules` |
+| AI triage | http://localhost:8086/v1/triage, `/metrics`; or `make triages`, `make triage id=N` |
 | Edge agent metrics | http://localhost:9102/metrics (site A), http://localhost:9103/metrics (site B) |
 | Stored log bundles | http://localhost:8888/buckets/log-bundles/ (SeaweedFS filer browser) |
 | Postgres | `make psql`, or `make bundles` for the latest log bundles |
@@ -93,7 +99,27 @@ make case id=1                        # its alerts, its log bundle, whether the 
 make resolve id=1 why="replaced fan"
 ```
 
+Every fault has a root cause the cloud never sees: an overheat is a dead fan, blocked airflow or a hot room; a sagging PSU rail is a failing supply, low site power or a loose cable; reallocated sectors are wear or a failing disk. `make fault kind=thermal cause=high_ambient` picks one (without `cause`, each device gets a random one), and `make answers` shows the truth behind recent alerts. The [edge agent's README](https://github.com/shubhampatel19/connectivity-edge-agent#root-causes) lists what each cause leaves in the device's log.
+
 The rules live in [`case-service/rules.json`](case-service/rules.json). Edit it and `make restart s=case-service` (cluster mode: `make deploy`) to change thresholds; a bad file stops the service at startup and logs every problem in it. `FAULT_RATE=0 make up` turns off spontaneous faults, so every case is one you caused.
+
+## AI triage
+
+Once a case's logs arrive, [AI triage](https://github.com/shubhampatel19/connectivity-ai-triage) writes a note for it within a poll (10 seconds). It picks the evidence from the log bundle under a token budget, retrieves the runbooks for the alert's possible causes, asks the model for a structured note, and checks every quote, device and runbook against what the model was given.
+
+```bash
+make fault kind=psu cause=loose_power_cable
+make triages               # a minute or so later: recent notes, newest first
+make triage id=3           # the whole note: evidence, runbooks, next steps, grounding checks, cost
+make answers               # what really happened, to grade it against
+make runbooks q="PSU1 AC input lost" code=power.rail_out_of_range   # retrieval, as triage sees it
+```
+
+Without an API key it runs on a deterministic fake model that knows this system's log formats: free, and good enough to exercise everything around the model. For real notes, `ANTHROPIC_API_KEY=sk-ant-... make up` (Claude Haiku, a fraction of a cent a case, capped at `TRIAGE_BUDGET_USD`, default $2 a day). In cluster mode, `ANTHROPIC_API_KEY=... make deploy` stores it in a Secret, then `make restart s=ai-triage`. A local model works too: `OLLAMA_URL=http://host.docker.internal:11434 make up`.
+
+`make eval` runs the triage eval suite (32 labelled cases from the edge agent's simulator, plus stress variants) inside the triage container against a scratch database; `make eval provider=anthropic repeat=3` grades Claude. The AI triage row on the dashboard shows outcomes, spend, the circuit breaker, latency, tokens, and notes that need a second look.
+
+**Upgrading from before Phase 6:** Postgres is now `pgvector/pgvector` (Debian-based) instead of `postgres:16-alpine`, so run `make down` once to start with a fresh volume. In cluster mode the triage API's host port, 8086, is set when the cluster is created: `make cluster-down && make cluster-up`.
 
 ## The WAN
 
@@ -254,6 +280,24 @@ Run `make chaos-install` first. Predict which alerts fire, in what order, before
 
 **25. Find the slow hop.** Run drill 19 (`make chaos e=postgres-latency`) again, but start from the traces this time: the p95 span duration panel, then one slow trace. Which span grew, and which didn't? Repeat with `make chaos e=ingest-kafka-packet-loss` and compare where the time goes.
 
+### AI triage
+
+Drills 26 to 31 work in either mode; 32 needs the cluster's two replicas.
+
+**26. Grade the model.** `make fault kind=thermal n=3` and `make fault kind=psu n=3`, then compare `make triages` with `make answers`. With the fake model they should all agree; with Claude (`ANTHROPIC_API_KEY`), find one it gets wrong or is unsure about, and read the note's evidence. Question to answer: for an overheat, the alert says `fan=3600rpm`; why can't triage tell a dead fan from a hot room without the bundle?
+
+**27. A log line that gives orders.** `make plant device=site-a-00042`, then `make fault kind=disk cause=disk_failing device=site-a-00042`. The planted line arrives the way such text really does, through a customer-editable asset tag, and asks the triage assistant to close the case. Read the note: is `injection_detected` set, is the cause still right, and did any of the next steps do what the line asked? `TriagePromptInjection` fires. Then write your own (`make plant device=... line="..."`) and try to change the answer. Question to answer: which defenses stopped it (the tags around device text, the system prompt, the model, the filter), and which one would you trust if the others were gone?
+
+**28. Rate limits and the breaker.** `make llm-faults spec="rate_limit=0.7"`, then `make fault kind=thermal site=b n=10`. Watch "Model requests by outcome": attempts are retried, notes still arrive, slower. Then `make llm-faults spec="server_error=1"` and fault a few more devices: the breaker opens, cases are `skipped_breaker` rather than failed, and `TriageCircuitOpen` fires. `make llm-faults` clears it; the waiting cases get notes within a poll or two. Question to answer: why does a skipped case not count as a failed attempt?
+
+**29. The budget runs out.** `TRIAGE_BUDGET_USD=0.002 make up` (compose; `make up` only recreates what changed), then `make fault kind=thermal site=b n=all`. The fake model is priced like Claude Haiku, so the budget goes in a handful of notes, `TriageBudgetExhausted` fires, and the rest wait. Question to answer: a site storm opens one site case and four device cases; which of them deserved the budget, and what would you change so it goes there first? Put the budget back with `make up`.
+
+**30. Evidence that never made it.** `make fault kind=thermal cause=fan_failure device=site-a-00077`, then within a few seconds `make plant device=site-a-00077 line="eth1: link down (port not cabled)" repeat=2000`. The flood fills the device's 1,000-line log ring and pushes out the BMC's one-shot `fan1 marked failed` line before the alert's bundle is taken (45 to 75 seconds after the fault starts). Read the note: the cause is still right. Why? Now do it again on another device with a second flood about 40 seconds in. Sometimes nothing useful is left, and the right answer becomes `insufficient_evidence`: is that what the note says? Question to answer: which kind of log line survives a log storm, a one-shot event or a periodic status report, and what would you change on the device so the evidence of a fault outlives a storm that follows it?
+
+**31. Retrieval is half the answer.** With a key set, `make eval provider=anthropic repeat=3` and note the category accuracy. In `connectivity-ai-triage`, delete the "Reading the evidence" section from `runbooks/thermal-blocked-airflow.md`, rebuild (`make up`), and run the evals again. Which confusions appear in the matrix, and why those? Put the section back. Question to answer: the fake model scores 100% either way; what does that tell you about what the fake can and can't test?
+
+**32. Kill a replica mid-triage (cluster mode).** `make llm-faults spec="latency_ms=20000"` (the fake model now takes 20 seconds a note, on both replicas), then `make fault kind=thermal`. When the new case's logs arrive (`make cases`), find the replica holding it: `make psql`, then `SELECT case_id, owner FROM triage.leases;` (the owner is the pod name and process ID). Delete that pod (`kubectl --context k3d-connectivity -n connectivity delete pod <name>`). The other replica can't take the case until the dead one's lease expires (`LEASE`, 5 minutes); `make triages` shows when it does. `make llm-faults` clears the faults. Question to answer: what does a shorter lease cost, and what would a lease renewed by a heartbeat cost instead?
+
 ## Design decisions that matter during incidents
 
 - **Batch IDs are idempotency keys.** A device assigns `batch_id` once and reuses it on every retry. The processor records batch IDs in the same transaction as the samples, so retries and replays are absorbed instead of double-counted.
@@ -277,6 +321,11 @@ Run `make chaos-install` first. Predict which alerts fire, in what order, before
 - **Three brokers, min ISR 2, acks=all.** The smallest Kafka cluster that survives losing a broker without losing acknowledged data. Losing two stops writes rather than risking data, which the devices' buffers and the gateway's queue are there to absorb.
 - **Pods drain before they stop.** A `preStop` sleep keeps an ingest API pod serving until the ingress has stopped sending it requests, then shutdown drains what's in flight. Without it, every deploy costs some devices a retry.
 - **Every build has its own image tag.** Deploying `:latest` or `:dev` makes a rollback a guess. Tagging by commit means `rollout undo` goes to a known build.
+- **Triage reads the case API, never the case tables.** It owns schema `triage` and polls `/v1/cases`, so the case service can change its tables freely, and a crash, restart or missed event in triage is just picked up on the next pass.
+- **A note is grounded, or visibly not.** Structured output makes the note valid JSON of the right shape; it doesn't make it true. Every quote is checked against the lines the model was shown, every device against the case, every runbook against what was retrieved, and the results are stored with the note.
+- **Device text is data.** Log lines and alert messages reach the model wrapped and labelled as untrusted, because some of them come from fields customers can edit. Next steps are suggestions for an engineer; nothing acts on them.
+- **Notes cost money, so evidence and retries are budgeted.** The log bundle is cut to a token budget, a case is triaged again for new bundles but not for new alerts, retries are counted and capped, and a daily budget summed in Postgres covers every replica.
+- **The fake model is a test double, not a model.** It makes the system around the model testable and free to run. Model quality is measured only by evals against a real model, on cases whose true cause is known.
 - **Liveness and readiness are separate.** `/healthz` stays up when Kafka is down, while `/readyz` reports it. Restarting the process wouldn't fix a dependency outage.
 
 ## Roadmap
@@ -286,6 +335,6 @@ Run `make chaos-install` first. Predict which alerts fire, in what order, before
 3. **Phase 3 (done): site gateway** (`connectivity-site-gateway`, Java 21). Device inventory, store-and-forward with a disk queue, a capped upstream connection pool, and JVM metrics. Site A runs direct, site B behind the gateway. CI takes the cloud down mid-run and checks that site B's data arrives with no gaps.
 4. **Phase 4 (done): alerts to cases** (`connectivity-case-service`). Devices raise alerts for thermal, PSU and disk faults; the gateway stores and forwards them; a rules engine opens cases with three layers of deduplication, including one site case for a storm; log bundles attach to their cases. CI injects faults and checks the exact cases that open, an alert carried through a cloud outage, and a full replay that changes nothing.
 5. **Phase 5 (done): production platform.** Cluster mode on k3d: three Kafka brokers, replicated services with probes and disruption budgets, commit-tagged rolling deploys. Toxiproxy on each site's WAN link in both modes. Chaos Mesh with eight experiments. Loki with every pod's logs, Kubernetes metrics and alerts, and OpenTelemetry tracing in every service into Tempo, with the device's trace carried through the gateway's disk queue and Kafka. CI runs the whole system on k3d and checks a WAN cut at one site, a rolling deploy, a broker killed by Chaos Mesh, and whole traces from both sites.
-6. **AI triage** (`connectivity-ai-triage`). LLM summaries of the log bundle attached to each case, RAG over runbooks, and an eval suite.
+6. **Phase 6 (done): AI triage** (`connectivity-ai-triage`, Python). Devices simulate eight root causes behind their three faults, with an answer key. A triage note for every case: evidence from the log bundle under a token budget, hybrid runbook retrieval over pgvector, Claude with structured output (or Ollama, or a deterministic fake), grounding checks, prompt-injection defenses, retries, a circuit breaker and a daily budget. An eval suite of labelled cases generated by the device simulator. CI checks in both modes that a fault's note names the cause the device was given, and that a planted prompt injection is flagged and not followed.
 
 After Phase 6: sealed bug drills, where a script applies a bug you haven't seen and you find it.

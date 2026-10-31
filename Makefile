@@ -29,7 +29,8 @@ endif
 COMPOSE := docker compose
 
 .PHONY: bootstrap tidy test up down ps logs stop start restart kill psql bundles lag topics devices gateway \
-        cases case resolve fault rules replay \
+        cases case resolve fault rules replay answers plant \
+        triage triages retriage runbooks eval llm-faults \
         wan wan-latency wan-bandwidth wan-flaky wan-blackhole wan-down wan-up wan-clear wan-reset \
         cluster-up cluster-down deploy edge cluster-status chaos-install chaos chaos-ls chaos-stop
 
@@ -166,9 +167,39 @@ resolve: ## make resolve id=12 why="replaced fan"
 rules: ## the case rules in effect
 	@curl -fsS $(CASES_URL)/v1/rules | python3 -m json.tool
 
-fault: ## force a fault: make fault kind=thermal|psu|disk [site=a|b] [n=3|all] [device=site-a-00007]
+fault: ## force a fault: make fault kind=thermal|psu|disk [cause=fan_failure|...] [site=a|b] [n=3|all] [device=site-a-00007]
 	@port=$$( [ "$(site)" = b ] && echo 9103 || echo 9102 ); \
-	 curl -fsS -X POST "localhost:$$port/debug/faults?kind=$(kind)&devices=$(or $(n),1)&device=$(device)"; echo
+	 curl -fsS -X POST "localhost:$$port/debug/faults?kind=$(kind)&cause=$(cause)&devices=$(or $(n),1)&device=$(device)"; echo
+
+answers: ## the true causes behind recent alerts, from the edge agent's answer key: make answers [site=a|b] [device=...]
+	@port=$$( [ "$(site)" = b ] && echo 9103 || echo 9102 ); \
+	 curl -fsS "localhost:$$port/debug/faults?device=$(device)&limit=$(or $(n),20)" | python3 -m json.tool
+
+plant: ## plant a line in device logs for their next bundle: make plant [site=a|b] [device=...|n=3|all] [line="..."] [repeat=N] (default line: a prompt injection)
+	@port=$$( [ "$(site)" = b ] && echo 9103 || echo 9102 ); q="devices=$(or $(n),1)&device=$(device)&repeat=$(or $(repeat),1)"; \
+	 if [ -n '$(line)' ]; then curl -fsS -X POST --data-binary '$(line)' "localhost:$$port/debug/logs?$$q"; \
+	 else curl -fsS -X POST "localhost:$$port/debug/logs?preset=prompt_injection&$$q"; fi; echo
 
 replay: ## replay every alert through the case service from offset 0; no case should change
 	@$(CLOUD) replay
+
+# ---------- AI triage ----------
+TRIAGE_URL := http://localhost:8086
+
+triages: ## recent triage notes, newest first
+	@python3 scripts/triages.py $(TRIAGE_URL)
+
+triage: ## one case's triage note, with its evidence checks, cost and latency: make triage id=12
+	@curl -fsS $(TRIAGE_URL)/v1/triage/$(id) | python3 -m json.tool
+
+retriage: ## triage a case again now, even if nothing changed: make retriage id=12
+	@curl -fsS -X POST $(TRIAGE_URL)/v1/triage/$(id)/rerun; echo
+
+runbooks: ## search the runbooks the way triage does: make runbooks q="PSU1 AC input lost" [code=power.rail_out_of_range]
+	@curl -fsS -G $(TRIAGE_URL)/v1/runbooks/search --data-urlencode "q=$(q)" --data-urlencode "code=$(code)" | python3 -m json.tool
+
+eval: ## run triage's evals against a scratch database: make eval [provider=fake|anthropic|ollama] [repeat=3]
+	@$(CLOUD) triage-eval '$(or $(provider),fake)' '$(or $(repeat),1)'
+
+llm-faults: ## make the fake model misbehave, on every replica: make llm-faults spec="rate_limit=0.5,latency_ms=2000" (no spec clears)
+	@$(CLOUD) triage-faults '$(spec)'

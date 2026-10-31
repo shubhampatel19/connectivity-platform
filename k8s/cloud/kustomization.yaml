@@ -9,6 +9,7 @@ resources:
   - ingest-api.yaml
   - telemetry-processor.yaml
   - case-service.yaml
+  - ai-triage.yaml
 # Development credentials, the same defaults compose mode uses. Edge devices
 # must present the same ENROLLMENT_KEY.
 secretGenerator:
@@ -35,4 +36,6 @@ images:
   - name: connectivity/telemetry-processor
     newTag: dev
   - name: connectivity/case-service
+    newTag: dev
+  - name: connectivity/ai-triage
     newTag: dev

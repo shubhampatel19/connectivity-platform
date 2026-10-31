@@ -225,3 +225,58 @@ groups:
         labels: { severity: ticket }
         annotations:
           summary: The case service hasn't refreshed its open-case gauges for 2 minutes; the Cases panels are showing old numbers.
+
+  - name: ai-triage
+    rules:
+      - alert: TriageBacklog
+        expr: max(connectivity_triage_pending_cases) > 0
+        for: 15m
+        labels: { severity: ticket }
+        annotations:
+          summary: "{{ $value }} cases with logs have waited more than 15 minutes for a triage note."
+          description: "The triage outcome panel says why: skipped_budget is the daily budget, skipped_breaker is the model provider, failed means read the notes' errors (make triages)."
+
+      - alert: TriageModelFailing
+        expr: |
+          sum(rate(connectivity_triage_llm_requests_total{outcome!="ok"}[5m]))
+            / sum(rate(connectivity_triage_llm_requests_total[5m])) > 0.5
+        for: 5m
+        labels: { severity: ticket }
+        annotations:
+          summary: More than half of the requests to the triage model are failing.
+          description: "By outcome: rate_limited means too much concurrency, timeout/overloaded/server_error is the provider, auth is the API key, invalid_output or truncated is the prompt or LLM_MAX_TOKENS."
+
+      - alert: TriageCircuitOpen
+        expr: max(connectivity_triage_llm_circuit_open) == 1
+        for: 2m
+        labels: { severity: ticket }
+        annotations:
+          summary: The triage model's circuit breaker is open; cases wait for notes until the provider recovers.
+
+      - alert: TriageSpendRateHigh
+        expr: sum(rate(connectivity_triage_llm_cost_usd_total[15m])) * 86400 > max(connectivity_triage_budget_limit_usd)
+        for: 10m
+        labels: { severity: page }
+        annotations:
+          summary: "Triage is spending at ${{ printf \"%.2f\" $value }} a day, more than its daily budget."
+          description: Something is calling the model far more than cases justify (a case triaged on every alert, a retry loop, a flood of cases). The budget will stop the spend within the day; find the cause before it does.
+
+      - alert: TriageBudgetExhausted
+        expr: sum(increase(connectivity_triage_cases_total{outcome="skipped_budget"}[10m])) > 0
+        labels: { severity: ticket }
+        annotations:
+          summary: The daily triage budget is spent; new cases get no note until spend falls back under it.
+
+      - alert: TriageNotesUngrounded
+        expr: sum(increase(connectivity_triage_grounding_failures_total[1h])) > 3
+        labels: { severity: ticket }
+        annotations:
+          summary: Triage notes are citing log lines, devices or runbooks the model was never given.
+          description: The model is making things up. Run the evals against the current model and prompt (make eval) before trusting its notes.
+
+      - alert: TriagePromptInjection
+        expr: sum(increase(connectivity_triage_injection_suspected_total[15m])) > 0
+        labels: { severity: ticket }
+        annotations:
+          summary: A device's log contains text aimed at an AI model.
+          description: It arrives through a field a customer can edit, like the asset tag. Find the case (make triages) and check what the note did with it.

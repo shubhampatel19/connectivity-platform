@@ -174,3 +174,106 @@ tests:
           - exp_labels: { severity: ticket }
             exp_annotations:
               summary: The case service hasn't refreshed its open-case gauges for 2 minutes; the Cases panels are showing old numbers.
+
+  # ---------- AI triage ----------
+  # Runaway spend: $0.03 every 30s is $86.40 a day against a $2 budget.
+  - interval: 30s
+    input_series:
+      - series: 'connectivity_triage_llm_cost_usd_total{job="ai-triage",provider="anthropic",model="claude-haiku-5-5"}'
+        values: '0+0.03x60'
+      - series: 'connectivity_triage_budget_limit_usd{job="ai-triage"}'
+        values: '2x60'
+    alert_rule_test:
+      - eval_time: 9m
+        alertname: TriageSpendRateHigh
+        exp_alerts: []
+      - eval_time: 26m
+        alertname: TriageSpendRateHigh
+        exp_alerts:
+          - exp_labels: { severity: page }
+            exp_annotations:
+              summary: "Triage is spending at $86.40 a day, more than its daily budget."
+              description: Something is calling the model far more than cases justify (a case triaged on every alert, a retry loop, a flood of cases). The budget will stop the spend within the day; find the cause before it does.
+  # Normal spend, about $0.86 a day: no alert.
+  - interval: 30s
+    input_series:
+      - series: 'connectivity_triage_llm_cost_usd_total{job="ai-triage",provider="anthropic",model="claude-haiku-5-5"}'
+        values: '0+0.0003x60'
+      - series: 'connectivity_triage_budget_limit_usd{job="ai-triage"}'
+        values: '2x60'
+    alert_rule_test:
+      - eval_time: 26m
+        alertname: TriageSpendRateHigh
+        exp_alerts: []
+  # The budget runs out; cases wait for notes, and the backlog builds.
+  - interval: 1m
+    input_series:
+      - series: 'connectivity_triage_cases_total{job="ai-triage",outcome="skipped_budget"}'
+        values: '0 0 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18'
+      - series: 'connectivity_triage_pending_cases{job="ai-triage"}'
+        values: '0 0 0 3x18'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: TriageBudgetExhausted
+        exp_alerts:
+          - exp_labels: { severity: ticket }
+            exp_annotations:
+              summary: The daily triage budget is spent; new cases get no note until spend falls back under it.
+      - eval_time: 10m
+        alertname: TriageBacklog
+        exp_alerts: []
+      - eval_time: 19m
+        alertname: TriageBacklog
+        exp_alerts:
+          - exp_labels: { severity: ticket }
+            exp_annotations:
+              summary: "3 cases with logs have waited more than 15 minutes for a triage note."
+              description: "The triage outcome panel says why: skipped_budget is the daily budget, skipped_breaker is the model provider, failed means read the notes' errors (make triages)."
+  # The provider rate-limits three requests in four, and the breaker opens.
+  - interval: 30s
+    input_series:
+      - series: 'connectivity_triage_llm_requests_total{job="ai-triage",provider="anthropic",model="claude-haiku-5-5",outcome="ok"}'
+        values: '0+1x30'
+      - series: 'connectivity_triage_llm_requests_total{job="ai-triage",provider="anthropic",model="claude-haiku-5-5",outcome="rate_limited"}'
+        values: '0+3x30'
+      - series: 'connectivity_triage_llm_circuit_open{job="ai-triage"}'
+        values: '0x4 1x26'
+    alert_rule_test:
+      - eval_time: 11m
+        alertname: TriageModelFailing
+        exp_alerts:
+          - exp_labels: { severity: ticket }
+            exp_annotations:
+              summary: More than half of the requests to the triage model are failing.
+              description: "By outcome: rate_limited means too much concurrency, timeout/overloaded/server_error is the provider, auth is the API key, invalid_output or truncated is the prompt or LLM_MAX_TOKENS."
+      - eval_time: 5m
+        alertname: TriageCircuitOpen
+        exp_alerts:
+          - exp_labels: { severity: ticket }
+            exp_annotations:
+              summary: The triage model's circuit breaker is open; cases wait for notes until the provider recovers.
+  # Ungrounded notes and a planted instruction.
+  - interval: 1m
+    input_series:
+      - series: 'connectivity_triage_grounding_failures_total{job="ai-triage",kind="evidence"}'
+        values: '0 1 2 3 4 5'
+      - series: 'connectivity_triage_injection_suspected_total{job="ai-triage",detector="filter"}'
+        values: '0 0 1 1 1 1'
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: TriageNotesUngrounded
+        exp_alerts: []
+      - eval_time: 5m
+        alertname: TriageNotesUngrounded
+        exp_alerts:
+          - exp_labels: { severity: ticket }
+            exp_annotations:
+              summary: Triage notes are citing log lines, devices or runbooks the model was never given.
+              description: The model is making things up. Run the evals against the current model and prompt (make eval) before trusting its notes.
+      - eval_time: 4m
+        alertname: TriagePromptInjection
+        exp_alerts:
+          - exp_labels: { severity: ticket }
+            exp_annotations:
+              summary: A device's log contains text aimed at an AI model.
+              description: It arrives through a field a customer can edit, like the asset tag. Find the case (make triages) and check what the note did with it.

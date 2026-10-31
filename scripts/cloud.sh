@@ -12,6 +12,8 @@
 #   cloud.sh stop|start|restart|kill|logs <service-or-pod>
 #   cloud.sh ps
 #   cloud.sh replay                       reprocess every alert from offset 0
+#   cloud.sh triage-eval <provider> <n>   AI triage's evals, n runs per case
+#   cloud.sh triage-faults <spec>         the fake model's faults, on every replica
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -137,6 +139,40 @@ replay() {
   [ -n "$ok" ] || { echo "could not reset the case-service offsets" >&2; exit 1; }
 }
 
+# AI triage's evals, run inside its container (it has the cases, the baked-in
+# embedding model and the API key) against a scratch database next to the
+# real one: evals write notes, spend and an index of their own, which must
+# not mix with the live service's.
+triage_eval() {
+  local provider=$1 repeat=$2
+  local dsn=postgresql://connectivity:connectivity@postgres:5432/triage_eval
+  sql "SELECT 1 FROM pg_database WHERE datname = 'triage_eval'" | grep -q 1 || sql "CREATE DATABASE triage_eval"
+  local args=(python -m triage eval --provider "$provider" --repeat "$repeat")
+  if [ "$MODE" = cluster ]; then
+    k exec deployment/ai-triage -- env DATABASE_URL="$dsn" "${args[@]}"
+  else
+    compose exec -T -e DATABASE_URL="$dsn" ai-triage "${args[@]}"
+  fi
+}
+
+# The fake model's fault injection lives in each process, so in cluster mode
+# it's set on every replica directly: through the Service it would reach
+# whichever one the load balancer picked.
+triage_faults() {
+  local spec=$1
+  if [ "$MODE" = cluster ]; then
+    local pod
+    for pod in $(k get pods -l app=ai-triage -o name); do
+      printf '%s: ' "${pod#pod/}"
+      k exec "$pod" -- python -c 'import sys, urllib.parse, urllib.request
+q = urllib.parse.urlencode({"spec": sys.argv[1]})
+print(urllib.request.urlopen(urllib.request.Request("http://localhost:8086/debug/llm-faults?" + q, method="POST")).read().decode())' "$spec"
+    done
+  else
+    curl -fsS -X POST -G localhost:8086/debug/llm-faults --data-urlencode "spec=$spec"; echo
+  fi
+}
+
 verb=${1:-}; shift || true
 case "$verb" in
   sql) sql "$1" ;;
@@ -150,5 +186,7 @@ case "$verb" in
   logs) logs "$1" ;;
   ps) ps_all ;;
   replay) replay ;;
-  *) sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+  triage-eval) triage_eval "${1:-fake}" "${2:-1}" ;;
+  triage-faults) triage_faults "${1:-}" ;;
+  *) sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
 esac

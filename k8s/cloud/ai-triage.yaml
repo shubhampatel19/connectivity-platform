@@ -1,0 +1,113 @@
+# AI triage: a note for every case once its logs arrive. Two replicas share
+# the work through leases in Postgres, so a case is triaged (and paid for)
+# once. With an ANTHROPIC_API_KEY in Secret ai-triage (cluster.sh creates it
+# from your environment) it uses Claude; without, the deterministic fake.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ai-triage
+  labels: { app: ai-triage }
+spec:
+  replicas: 2
+  selector:
+    matchLabels: { app: ai-triage }
+  strategy:
+    rollingUpdate: { maxSurge: 1, maxUnavailable: 0 }
+  template:
+    metadata:
+      labels: { app: ai-triage }
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8086"
+    spec:
+      enableServiceLinks: false
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: ai-triage
+          image: connectivity/ai-triage
+          env:
+            - name: DATABASE_URL
+              valueFrom: { secretKeyRef: { name: connectivity, key: DATABASE_URL } }
+            - { name: CASES_URL, value: "http://case-service:8085" }
+            - { name: S3_ENDPOINT, value: "object-store:8333" }
+            - name: S3_ACCESS_KEY
+              valueFrom: { secretKeyRef: { name: connectivity, key: S3_ACCESS_KEY } }
+            - name: S3_SECRET_KEY
+              valueFrom: { secretKeyRef: { name: connectivity, key: S3_SECRET_KEY } }
+            - { name: S3_BUCKET, value: log-bundles }
+            - { name: LLM_PROVIDER, value: auto }
+            - name: ANTHROPIC_API_KEY
+              valueFrom: { secretKeyRef: { name: ai-triage, key: ANTHROPIC_API_KEY, optional: true } }
+            - { name: DAILY_BUDGET_USD, value: "2" }
+            - { name: LOG_LEVEL, value: info }
+            # One trace per triaged case: case API, bundle reads, retrieval,
+            # and a span per model call with its token usage.
+            - { name: OTEL_EXPORTER_OTLP_ENDPOINT, value: "http://tempo:4318" }
+          ports:
+            - { name: http, containerPort: 8086 }
+          # Startup indexes the runbooks (embedding any that changed), which
+          # takes a few seconds on a busy node.
+          startupProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 2
+            failureThreshold: 60
+          readinessProbe:
+            httpGet: { path: /readyz, port: http }
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 10
+            failureThreshold: 3
+          lifecycle:
+            preStop:
+              sleep: { seconds: 5 }
+          resources:
+            # The embedding model (ONNX, on the CPU) is most of the memory.
+            requests: { cpu: 50m, memory: 256Mi }
+            limits: { memory: 768Mi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: [ALL] }
+          volumeMounts:
+            # Eval reports (make eval) and anything else that wants scratch space.
+            - { name: tmp, mountPath: /tmp }
+      volumes:
+        - name: tmp
+          emptyDir: { sizeLimit: 64Mi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ai-triage
+  labels: { app: ai-triage }
+spec:
+  selector: { app: ai-triage }
+  ports:
+    - { name: http, port: 8086, targetPort: http }
+---
+# The triage API on host port 8086, as in compose mode (make triage, make triages).
+apiVersion: v1
+kind: Service
+metadata:
+  name: ai-triage-external
+  labels: { app: ai-triage }
+spec:
+  type: NodePort
+  selector: { app: ai-triage }
+  ports:
+    - { name: http, port: 8086, targetPort: http, nodePort: 30086 }
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: ai-triage
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels: { app: ai-triage }

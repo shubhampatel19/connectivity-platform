@@ -12,7 +12,8 @@
 #   ├── connectivity-ingest-api/
 #   ├── connectivity-telemetry-processor/
 #   ├── connectivity-case-service/
-#   └── connectivity-site-gateway/       (Java, not part of go.work)
+#   ├── connectivity-site-gateway/       (Java, not part of go.work)
+#   └── connectivity-ai-triage/          (Python, not part of go.work)
 set -euo pipefail
 
 OWNER="${OWNER:-shubhampatel19}"
@@ -26,6 +27,7 @@ GO_REPOS=(
 )
 OTHER_REPOS=(
   connectivity-site-gateway
+  connectivity-ai-triage
 )
 
 WORKSPACE="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
