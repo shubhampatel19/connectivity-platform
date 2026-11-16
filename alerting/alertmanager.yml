@@ -1,0 +1,43 @@
+# Where alerts go once Prometheus decides they are firing.
+#
+# Everything ends at the pager (alerting/pager.py), which keeps a timeline
+# and forwards pages to a phone when NTFY_URL is set. The split below is the
+# one that matters on call:
+#
+#   severity=page    someone must look now; data is being lost or will be
+#   severity=ticket  someone must look in working hours
+#
+# Alerts are grouped so that one failure is one notification: a site-wide
+# problem that trips an alert for 100 devices arrives once, not 100 times.
+route:
+  receiver: pager
+  group_by: [alertname, site]
+  group_wait: 10s        # collect alerts that start together into one notification
+  group_interval: 1m     # then at most one update a minute for that group
+  repeat_interval: 2h    # and a reminder while it stays firing
+  routes:
+    # The heartbeat: always firing, sent every minute. If the pager stops
+    # receiving it, the alerting pipeline itself is broken, which is the one
+    # failure no alert can report.
+    - matchers: [alertname = Watchdog]
+      receiver: watchdog
+      group_wait: 0s
+      group_interval: 1m
+      repeat_interval: 1m
+
+# A page already says something is wrong at that site; the ticket-level
+# alerts about the same site would only add noise while it's being handled.
+# Nothing is hidden for good: inhibited alerts still show in Prometheus.
+inhibit_rules:
+  - source_matchers: [alertname = TargetDown, job = kafka]
+    target_matchers: [alertname =~ "ConsumerLagHigh|CaseServiceLag"]
+
+receivers:
+  - name: pager
+    webhook_configs:
+      - url: http://pager:9099/alert
+        send_resolved: true
+  - name: watchdog
+    webhook_configs:
+      - url: http://pager:9099/watchdog
+        send_resolved: false
