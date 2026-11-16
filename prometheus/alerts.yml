@@ -309,18 +309,26 @@ groups:
           summary: The pager could not send a page to the phone. The timeline still has it.
 
       - alert: DeadLettersWritten
-        expr: sum by (topic) (increase(connectivity_processor_dead_lettered_total[10m])) > 0
+        expr: |
+          sum by (topic) (
+            increase(connectivity_processor_dead_lettered_total[10m])
+              or increase(connectivity_case_dead_lettered_total[10m])
+          ) > 0
         labels: { severity: ticket }
         annotations:
-          summary: "The processor set aside records from {{ $labels.topic }} that it could never store. Read them with make dlq."
+          summary: "A consumer set aside records from {{ $labels.topic }} that it could never process. Read them with make dlq t={{ $labels.topic }}."
           description: One device or one bad producer is the usual cause. The partition is not blocked; the records are in the dead-letter topic.
 
       - alert: DeadLetterWriteFailing
-        expr: sum by (topic) (increase(connectivity_processor_dead_letter_failures_total[10m])) > 0
+        expr: |
+          sum by (topic) (
+            increase(connectivity_processor_dead_letter_failures_total[10m])
+              or increase(connectivity_case_dead_letter_failures_total[10m])
+          ) > 0
         labels: { severity: page }
         annotations:
           summary: "Poison records from {{ $labels.topic }} were skipped without reaching the dead-letter topic."
-          description: They are still in the source topic at the partition and offset in the processor's log, until retention removes them.
+          description: They are still in the source topic at the partition and offset in the consumer's log, until retention removes them.
 
       - alert: IngestSheddingLoad
         expr: sum(rate(connectivity_ingest_requests_shed_total[2m])) > 0

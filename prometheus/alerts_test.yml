@@ -284,6 +284,8 @@ tests:
         values: '0 0 3 3 3'
       - series: 'connectivity_processor_dead_letter_failures_total{job="telemetry-processor",topic="device.events"}'
         values: '0 0 1 1 1'
+      - series: 'connectivity_case_dead_lettered_total{job="case-service",topic="device.alerts"}'
+        values: '0 0 2 2 2'
       - series: 'connectivity_ingest_requests_shed_total{job="ingest-api",route="telemetry"}'
         values: '0+30x20'
       - series: 'connectivity_processor_retention_last_success_timestamp_seconds{job="telemetry-processor"}'
@@ -308,7 +310,11 @@ tests:
         exp_alerts:
           - exp_labels: { severity: ticket, topic: telemetry.raw }
             exp_annotations:
-              summary: "The processor set aside records from telemetry.raw that it could never store. Read them with make dlq."
+              summary: "A consumer set aside records from telemetry.raw that it could never process. Read them with make dlq t=telemetry.raw."
+              description: One device or one bad producer is the usual cause. The partition is not blocked; the records are in the dead-letter topic.
+          - exp_labels: { severity: ticket, topic: device.alerts }
+            exp_annotations:
+              summary: "A consumer set aside records from device.alerts that it could never process. Read them with make dlq t=device.alerts."
               description: One device or one bad producer is the usual cause. The partition is not blocked; the records are in the dead-letter topic.
       - eval_time: 2m
         alertname: DeadLetterWriteFailing
@@ -316,7 +322,7 @@ tests:
           - exp_labels: { severity: page, topic: device.events }
             exp_annotations:
               summary: "Poison records from device.events were skipped without reaching the dead-letter topic."
-              description: They are still in the source topic at the partition and offset in the processor's log, until retention removes them.
+              description: They are still in the source topic at the partition and offset in the consumer's log, until retention removes them.
       - eval_time: 2m
         alertname: PagerNotificationsFailing
         exp_alerts:

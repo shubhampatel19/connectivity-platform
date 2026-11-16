@@ -65,13 +65,13 @@ Each runbook says what the alert means, where to look first, and how to stop the
 **Mitigate:** usually nothing beyond what `ConsumerLagHigh` asks for.
 
 ### DeadLettersWritten
-**Means:** the processor met records it can never store and copied them to a dead-letter topic. The partition is not blocked.
-**Look at:** `make dlq t=telemetry.raw`. The `x-dlq-reason` header says why, and the key is the device.
+**Means:** the telemetry processor or the case service met records it can never process and copied them to a dead-letter topic. The partition is not blocked.
+**Look at:** `make dlq t=<topic>` with the topic the alert names. The `x-dlq-reason` header says why, and the key is the device.
 **Mitigate:** find the producer. The ingest API should have refused this record, so either something wrote to Kafka directly or validation has a gap.
 
 ### DeadLetterWriteFailing
 **Means:** poison records are being skipped without reaching the dead-letter topic.
-**Look at:** `make topics`: do the `.dlq` topics exist and have a leader? The processor's log has each record's source partition and offset.
+**Look at:** `make topics`: do the `.dlq` topics exist and have a leader? The consumer's log has each record's source partition and offset.
 **Mitigate:** create or repair the dead-letter topics. Recover the skipped records from the source topic before retention removes them.
 
 ### RetentionStalled

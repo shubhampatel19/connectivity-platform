@@ -65,8 +65,8 @@ Keying by device puts each device's records on one partition, in order. Consumer
 | Hop | Guarantee | How | What breaks it |
 |---|---|---|---|
 | Device → cloud (site A) | Delivered at least once, until the buffer overflows | Same `batch_id` on every retry; bounded ring buffer | An outage longer than the buffer; an agent restart (memory) |
-| Device → gateway (site B) | 202 means on the gateway's disk | Disk queue, one file per record | Queue full (evicts oldest) |
-| Gateway → cloud | In arrival order, at least once | One forwarder thread, head-of-line retry | A record the cloud rejects for good is dropped |
+| Device → gateway (site B) | 202 means on the gateway's disk, through a power cut | Disk queue, one file per record, flushed before the 202 | Queue full (evicts oldest) |
+| Gateway → cloud | In arrival order, at least once | One forwarder thread, head-of-line retry; a credential refusal holds the queue | A record the cloud rejects for good is dropped; so is one whose credentials are refused for 30 minutes |
 | ingest-api → Kafka | 202 means durable | `acks=all`; min ISR 2 of 3 in cluster mode | Fewer in-sync replicas than the minimum: writes are refused, not lost |
 | Kafka → Postgres | Effectively once | Commit offset after the database commit; idempotent on `batch_id` | A batch replayed after its marker has aged out (`BATCH_ID_RETENTION`) |
 | Alert → case | Exactly one decision per alert | `alert_id` primary key; one open case per subject and rule (partial unique index); advisory lock per site and rule | |
