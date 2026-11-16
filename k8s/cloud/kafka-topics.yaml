@@ -22,8 +22,20 @@ spec:
               until [ "$(/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server $b 2>/dev/null | grep -c '^kafka-' || true)" -ge 3 ]; do
                 echo "waiting for 3 brokers"; sleep 5
               done
+              c=/opt/kafka/bin/kafka-configs.sh
+              # name:partitions. Each source topic has a dead-letter topic, where a
+              # consumer puts a record it can never process (see `make dlq`).
               for t in telemetry.raw:6 device.events:3 bundles.uploaded:3 device.alerts:3; do
                 $k --bootstrap-server $b --create --if-not-exists --topic "${t%:*}" --partitions "${t#*:}" --replication-factor 3
+                $k --bootstrap-server $b --create --if-not-exists --topic "${t%:*}.dlq" --partitions 1 --replication-factor 3
+              done
+              # Retention, set on every run so an existing topic gets it too. The
+              # brokers' volumes are 2Gi each: 6 partitions at 128 MB is the most
+              # telemetry.raw can hold on one broker. Batch markers in Postgres
+              # (BATCH_ID_RETENTION) must outlive the time limit here.
+              for t in telemetry.raw device.events bundles.uploaded device.alerts; do
+                $c --bootstrap-server $b --alter --entity-type topics --entity-name "$t" --add-config retention.ms=10800000,retention.bytes=134217728
+                $c --bootstrap-server $b --alter --entity-type topics --entity-name "$t.dlq" --add-config retention.ms=604800000,retention.bytes=67108864
               done
               $k --bootstrap-server $b --describe
           env:

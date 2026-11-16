@@ -4,6 +4,8 @@ resources:
   - prometheus.yaml
   - kube-state-metrics.yaml
   - kafka-exporter.yaml
+  - postgres-exporter.yaml
+  - alertmanager.yaml
   - loki.yaml
   - alloy.yaml
   - tempo.yaml
@@ -18,6 +20,12 @@ configMapGenerator:
     files:
       - ../../prometheus/alerts.yml
       - ../../prometheus/alerts-k8s.yml
+  - name: alertmanager-config
+    files:
+      - ../../alerting/alertmanager.yml
+  - name: pager-app
+    files:
+      - ../../alerting/pager.py
   - name: loki-config
     files:
       - loki.yaml=loki-config.yaml

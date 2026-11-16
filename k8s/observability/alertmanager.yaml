@@ -1,0 +1,120 @@
+# Alertmanager routes firing alerts to the pager; the pager keeps the
+# incident timeline and can notify a phone. Same config and script as compose
+# mode (alerting/). Host ports 9093 and 9099 exist on clusters created after
+# these were added; on an older cluster `make pages` still works, because it
+# asks the pager from inside the cluster.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: alertmanager
+  labels: { app: alertmanager }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: alertmanager }
+  template:
+    metadata:
+      labels: { app: alertmanager }
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9093"
+    spec:
+      enableServiceLinks: false
+      containers:
+        - name: alertmanager
+          image: prom/alertmanager:v0.27.0
+          args:
+            - --config.file=/etc/alertmanager/alertmanager.yml
+            - --storage.path=/alertmanager
+          ports:
+            - { name: http, containerPort: 9093 }
+          readinessProbe:
+            httpGet: { path: /-/ready, port: http }
+            periodSeconds: 5
+          resources:
+            requests: { cpu: 10m, memory: 32Mi }
+            limits: { memory: 128Mi }
+          volumeMounts:
+            - { name: config, mountPath: /etc/alertmanager }
+            - { name: data, mountPath: /alertmanager }
+      volumes:
+        - name: config
+          configMap: { name: alertmanager-config }
+        # Silences and notification state are lost with the pod. Fine here; a
+        # real one has a volume and usually two peers.
+        - name: data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: alertmanager
+  labels: { app: alertmanager }
+spec:
+  type: NodePort
+  selector: { app: alertmanager }
+  ports:
+    - { name: http, port: 9093, targetPort: http, nodePort: 30093 }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pager
+  labels: { app: pager }
+spec:
+  replicas: 1
+  strategy: { type: Recreate } # one writer for the timeline volume
+  selector:
+    matchLabels: { app: pager }
+  template:
+    metadata:
+      labels: { app: pager }
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9099"
+    spec:
+      enableServiceLinks: false
+      containers:
+        - name: pager
+          image: python:3.12-alpine
+          command: ["python", "-u", "/app/pager.py"]
+          env:
+            # Set with `NTFY_URL=https://ntfy.sh/<topic> make deploy`.
+            - name: NTFY_URL
+              valueFrom: { secretKeyRef: { name: pager, key: NTFY_URL, optional: true } }
+          ports:
+            - { name: http, containerPort: 9099 }
+          readinessProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 5
+          resources:
+            requests: { cpu: 10m, memory: 32Mi }
+            limits: { memory: 128Mi }
+          volumeMounts:
+            - { name: app, mountPath: /app }
+            - { name: data, mountPath: /data }
+      volumes:
+        - name: app
+          configMap: { name: pager-app }
+        - name: data
+          persistentVolumeClaim: { claimName: pager-data }
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: pager-data
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests: { storage: 100Mi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: pager
+  labels: { app: pager }
+spec:
+  type: NodePort
+  selector: { app: pager }
+  ports:
+    - { name: http, port: 9099, targetPort: http, nodePort: 30099 }

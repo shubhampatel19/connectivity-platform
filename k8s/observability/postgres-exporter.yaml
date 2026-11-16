@@ -1,0 +1,31 @@
+# Database size, connections and locks, scraped as job "postgres" like in
+# compose mode.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres-exporter
+  labels: { app: postgres-exporter }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: postgres-exporter }
+  template:
+    metadata:
+      labels: { app: postgres-exporter }
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9187"
+        prometheus.io/job: postgres
+    spec:
+      enableServiceLinks: false
+      containers:
+        - name: postgres-exporter
+          image: prometheuscommunity/postgres-exporter:v0.15.0
+          env:
+            - name: DATA_SOURCE_NAME
+              valueFrom: { secretKeyRef: { name: connectivity, key: DATABASE_URL } }
+          ports:
+            - { name: metrics, containerPort: 9187 }
+          resources:
+            requests: { cpu: 10m, memory: 32Mi }
+            limits: { memory: 128Mi }

@@ -8,6 +8,8 @@ In cluster mode every service is traced with OpenTelemetry, and one trace follow
 
 Every case then gets a triage note from an LLM: the likely root cause, the log lines that show it, the runbooks that apply, checked so that it can only cite what the model was really given. The simulated devices know the true cause of every fault they raise, so the notes can be graded against the truth, live and in an eval suite.
 
+**Start with [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** for how the whole system fits together; each component repo has a `docs/DESIGN.md` for its code. [docs/RUNBOOKS.md](docs/RUNBOOKS.md) has a runbook for every alert.
+
 This repo holds the local platform: the compose stack, the Kubernetes manifests, Prometheus, Grafana, Loki and Tempo config, alert rules, chaos experiments, and the workspace tooling that ties the component repos together.
 
 ```
@@ -56,7 +58,7 @@ git clone https://github.com/shubhampatel19/connectivity-platform.git
 cd connectivity-platform
 make bootstrap   # clones the other repos next to this one, creates ../go.work
 make test        # unit tests with the race detector, every module
-make up          # compose mode: builds images and starts 15 containers
+make up          # compose mode: builds images and starts 18 containers
 ```
 
 After about a minute:
@@ -71,6 +73,7 @@ After about a minute:
 | Case service | http://localhost:8085/v1/cases, `/metrics`; or `make cases`, `make case id=N`, `make rules` |
 | AI triage | http://localhost:8086/v1/triage, `/metrics`; or `make triages`, `make triage id=N` |
 | Edge agent metrics | http://localhost:9102/metrics (site A), http://localhost:9103/metrics (site B) |
+| Pager | http://localhost:9099 (the incident timeline), or `make pages`; Alertmanager on http://localhost:9093 |
 | Stored log bundles | http://localhost:8888/buckets/log-bundles/ (SeaweedFS filer browser) |
 | Postgres | `make psql`, or `make bundles` for the latest log bundles |
 
@@ -86,6 +89,35 @@ GROUP BY device_id HAVING max(value) > 80 ORDER BY peak_c DESC;
 -- what the case service decided about every alert, by rule
 SELECT coalesce(rule_id, '(none)') AS rule, outcome, count(*) FROM cases.alerts GROUP BY 1, 2 ORDER BY 1, 2;
 ```
+
+## On call
+
+Alerts don't stop at a web page. Prometheus sends them to Alertmanager, which groups them and routes them to the pager. The pager keeps a timeline and, if you give it a topic, notifies your phone through [ntfy](https://ntfy.sh):
+
+```bash
+NTFY_URL=https://ntfy.sh/<a-topic-name-only-you-know> make up     # cluster mode: ... make deploy
+make pages                 # what fired, when, and the runbook for each
+make pages kind=page       # only what would have woken you
+make report text="site B says its dashboards are empty"   # a person noticed something
+make dlq                   # records a consumer set aside, and why
+```
+
+Pages (`severity: page`) go to the phone; tickets are recorded only. Install the ntfy app, subscribe to your topic, and pick a topic name nobody could guess: anyone who knows it can read your pages.
+
+## Sealed drills
+
+The warm-up drills below are failures you cause yourself, so you know the answer before you look. A sealed drill is one you don't:
+
+```bash
+make drill            # something will break in the next 1 to 10 minutes; you aren't told what
+#   ... a page, a ticket, or a report arrives (make pages, or your phone)
+make drill-ack        # you've noticed
+#   ... find it, stop the damage
+make drill-mitigated
+make drill-reveal     # what it was, how long each step took, and a postmortem to fill in
+```
+
+Do the warm-up drills first: you can't spot what's wrong until you know what normal looks like. Don't read `drills/scenarios` until a drill has been revealed to you. `make drill-abort` undoes a drill without spoiling it. A drill that changes a service's settings restarts that service with only its default settings plus the change, so start the stack plainly (`make up`) before arming one.
 
 ## Faults, alerts and cases
 
@@ -228,6 +260,8 @@ SELECT (SELECT sum(sample_count) FROM ingested_batches) AS expected,
        (SELECT count(*) FROM telemetry) AS actual;
 ```
 
+This holds until retention drops its first telemetry partition (6 hours after `make up`; 2 hours in cluster mode), because batch markers are kept longer than the samples. Run these drills on a fresh stack, or raise `TELEMETRY_RETENTION`.
+
 **4. Object store outage.** Use `BUNDLE_INTERVAL=1m make up` so bundles flow constantly, then `make stop s=object-store` for 5 minutes. Halfway through, `make fault kind=thermal n=5` so some alert bundles join the backlog.
 Telemetry should be completely unaffected, and `/readyz` should stay 200, which is a deliberate design choice (see the ingest API README). `ObjectStoreErrors` should fire, and the edge spool backlog should climb. The five thermal cases still open, with `logs=waiting`. After `make start s=object-store`, the backlog should drain, alert bundles first, and those cases flip to `logs=attached`. Question to answer: how long until the spool hits `SPOOL_MAX_BUNDLES` and `BundlesEvicted` fires?
 
@@ -337,4 +371,6 @@ Drills 26 to 31 work in either mode; 32 needs the cluster's two replicas.
 5. **Phase 5 (done): production platform.** Cluster mode on k3d: three Kafka brokers, replicated services with probes and disruption budgets, commit-tagged rolling deploys. Toxiproxy on each site's WAN link in both modes. Chaos Mesh with eight experiments. Loki with every pod's logs, Kubernetes metrics and alerts, and OpenTelemetry tracing in every service into Tempo, with the device's trace carried through the gateway's disk queue and Kafka. CI runs the whole system on k3d and checks a WAN cut at one site, a rolling deploy, a broker killed by Chaos Mesh, and whole traces from both sites.
 6. **Phase 6 (done): AI triage** (`connectivity-ai-triage`, Python). Devices simulate eight root causes behind their three faults, with an answer key. A triage note for every case: evidence from the log bundle under a token budget, hybrid runbook retrieval over pgvector, Claude with structured output (or Ollama, or a deterministic fake), grounding checks, prompt-injection defenses, retries, a circuit breaker and a daily budget. An eval suite of labelled cases generated by the device simulator. CI checks in both modes that a fault's note names the cause the device was given, and that a planted prompt injection is flagged and not followed.
 
-After Phase 6: sealed bug drills, where a script applies a bug you haven't seen and you find it.
+7. **Phase 7 (done): on call.** Alertmanager and a pager with a timeline and phone notifications; a runbook for every alert; dead-letter topics; retention for telemetry, batch markers and Kafka; database alerts; a mixed-firmware fleet with skewed clocks; and sealed drills with a timeline and a postmortem.
+
+Next: device certificates in place of shared-secret tokens, backups and a restore drill, and sealed drills that ship a bad build rather than a bad setting.

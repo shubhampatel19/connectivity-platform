@@ -1,3 +1,6 @@
 .env
 .mode
 .deploy/
+.drills/
+postmortems/*.md
+!postmortems/README.md

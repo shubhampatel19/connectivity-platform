@@ -7,6 +7,11 @@ global:
 rule_files:
   - /etc/prometheus/rules/*.yml
 
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ["alertmanager:9093"]
+
 scrape_configs:
   # Every pod in the namespace annotated prometheus.io/scrape. The job is the
   # pod's app label (ingest-api, case-service, ...), or prometheus.io/job when

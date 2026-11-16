@@ -95,3 +95,14 @@ groups:
         annotations:
           summary: "{{ $value | printf \"%.0f\" }} partitions of {{ $labels.topic }} have no leader."
           description: Unclean leader election is off, so these stay offline until a broker holding an in-sync copy returns.
+
+      # Postgres has a 2Gi volume in cluster mode. Retention keeps the
+      # database under 1 GB; past 1.4 GB something has stopped deleting, and
+      # a full volume takes the database down.
+      - alert: PostgresVolumeFillingUp
+        expr: sum(pg_database_size_bytes) > 1.4e9
+        for: 5m
+        labels: { severity: page }
+        annotations:
+          summary: "Postgres holds {{ $value | humanize1024 }}B on a 2Gi volume."
+          description: Check that retention is running (RetentionStalled) and what grew, with pg_total_relation_size.

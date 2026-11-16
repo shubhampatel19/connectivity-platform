@@ -277,3 +277,121 @@ tests:
             exp_annotations:
               summary: A device's log contains text aimed at an AI model.
               description: It arrives through a field a customer can edit, like the asset tag. Find the case (make triages) and check what the note did with it.
+  # Dead letters, shedding, retention, the database, the pager.
+  - interval: 30s
+    input_series:
+      - series: 'connectivity_processor_dead_lettered_total{job="telemetry-processor",topic="telemetry.raw"}'
+        values: '0 0 3 3 3'
+      - series: 'connectivity_processor_dead_letter_failures_total{job="telemetry-processor",topic="device.events"}'
+        values: '0 0 1 1 1'
+      - series: 'connectivity_ingest_requests_shed_total{job="ingest-api",route="telemetry"}'
+        values: '0+30x20'
+      - series: 'connectivity_processor_retention_last_success_timestamp_seconds{job="telemetry-processor"}'
+        values: '0x120'
+      - series: 'pg_up{job="postgres"}'
+        values: '0x20'
+      - series: 'pg_database_size_bytes{job="postgres",datname="connectivity"}'
+        values: '4294967296x60'
+      - series: 'pg_stat_activity_count{job="postgres",datname="connectivity",state="active"}'
+        values: '90x20'
+      - series: 'pg_settings_max_connections{job="postgres"}'
+        values: '100x20'
+      - series: 'pg_stat_activity_max_tx_duration{job="postgres",datname="connectivity",state="active"}'
+        values: '0+30x20'
+      - series: 'connectivity_pager_watchdog_last_seen_timestamp_seconds{job="pager"}'
+        values: '1x30'
+      - series: 'connectivity_pager_notifications_total{job="pager",result="failed"}'
+        values: '0 0 2 2 2'
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: DeadLettersWritten
+        exp_alerts:
+          - exp_labels: { severity: ticket, topic: telemetry.raw }
+            exp_annotations:
+              summary: "The processor set aside records from telemetry.raw that it could never store. Read them with make dlq."
+              description: One device or one bad producer is the usual cause. The partition is not blocked; the records are in the dead-letter topic.
+      - eval_time: 2m
+        alertname: DeadLetterWriteFailing
+        exp_alerts:
+          - exp_labels: { severity: page, topic: device.events }
+            exp_annotations:
+              summary: "Poison records from device.events were skipped without reaching the dead-letter topic."
+              description: They are still in the source topic at the partition and offset in the processor's log, until retention removes them.
+      - eval_time: 2m
+        alertname: PagerNotificationsFailing
+        exp_alerts:
+          - exp_labels: { severity: ticket, job: pager, result: failed }
+            exp_annotations:
+              summary: The pager could not send a page to the phone. The timeline still has it.
+      - eval_time: 5m
+        alertname: IngestSheddingLoad
+        exp_alerts:
+          - exp_labels: { severity: page }
+            exp_annotations:
+              summary: The ingest API is refusing requests because it has reached MAX_IN_FLIGHT.
+              description: Requests are piling up behind something slow, usually Kafka, or the limit is set too low for the fleet.
+      - eval_time: 3m
+        alertname: PostgresDown
+        exp_alerts:
+          - exp_labels: { severity: page, job: postgres }
+            exp_annotations:
+              summary: The Postgres exporter cannot reach the database.
+      - eval_time: 8m
+        alertname: PostgresConnectionsNearLimit
+        exp_alerts:
+          - exp_labels: { severity: page }
+            exp_annotations:
+              summary: More than 80% of Postgres connections are in use. New connections will soon be refused.
+      - eval_time: 9m
+        alertname: PostgresLongTransaction
+        exp_alerts:
+          - exp_labels: { severity: ticket }
+            exp_annotations:
+              summary: A transaction in the connectivity database has been open for more than 5 minutes.
+              description: A long transaction holds locks and stops vacuum. Find it in pg_stat_activity.
+      - eval_time: 8m
+        alertname: PagerHeartbeatLost
+        exp_alerts:
+          - exp_labels: { severity: ticket, job: pager }
+            exp_annotations:
+              summary: The pager has not heard from Alertmanager for 5 minutes. Alerts may not be reaching anyone.
+      - eval_time: 12m
+        alertname: PostgresDatabaseLarge
+        exp_alerts:
+          - exp_labels: { severity: ticket, job: postgres, datname: connectivity }
+            exp_annotations:
+              summary: "The connectivity database is 4GiB. Retention should be holding it below this."
+      - eval_time: 40m
+        alertname: RetentionStalled
+        exp_alerts:
+          - exp_labels: { severity: ticket }
+            exp_annotations:
+              summary: No processor replica has completed a retention pass for 30 minutes. Telemetry partitions are not being created or dropped.
+      - eval_time: 1m
+        alertname: Watchdog
+        exp_alerts:
+          - exp_labels: { severity: none }
+            exp_annotations:
+              summary: Heartbeat for the alerting pipeline. Always firing.
+  # A healthy system: none of the new alerts fire.
+  - interval: 30s
+    input_series:
+      - series: 'connectivity_processor_dead_lettered_total{job="telemetry-processor",topic="telemetry.raw"}'
+        values: '0x40'
+      - series: 'connectivity_ingest_requests_shed_total{job="ingest-api",route="telemetry"}'
+        values: '0x40'
+      - series: 'connectivity_processor_retention_last_success_timestamp_seconds{job="telemetry-processor"}'
+        values: '0+30x40'
+      - series: 'pg_up{job="postgres"}'
+        values: '1x40'
+      - series: 'pg_database_size_bytes{job="postgres",datname="connectivity"}'
+        values: '500000000x40'
+      - series: 'connectivity_pager_watchdog_last_seen_timestamp_seconds{job="pager"}'
+        values: '0+30x40'
+    alert_rule_test:
+      - { eval_time: 15m, alertname: DeadLettersWritten, exp_alerts: [] }
+      - { eval_time: 15m, alertname: IngestSheddingLoad, exp_alerts: [] }
+      - { eval_time: 15m, alertname: RetentionStalled, exp_alerts: [] }
+      - { eval_time: 15m, alertname: PostgresDown, exp_alerts: [] }
+      - { eval_time: 15m, alertname: PostgresDatabaseLarge, exp_alerts: [] }
+      - { eval_time: 15m, alertname: PagerHeartbeatLost, exp_alerts: [] }

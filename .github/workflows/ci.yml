@@ -1,8 +1,9 @@
 name: ci
 
+# Every push runs CI, on any branch, so a branch is verified before a pull
+# request exists.
 on:
   push:
-    branches: [main]
   pull_request:
   workflow_dispatch:
 
@@ -12,7 +13,43 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - name: Shell scripts
-        run: shellcheck scripts/*.sh
+        run: shellcheck scripts/*.sh drills/scenarios/*.sh
+      - name: Alertmanager config
+        run: |
+          docker run --rm -v "$PWD/alerting:/cfg:ro" --entrypoint amtool prom/alertmanager:v0.27.0 \
+            check-config /cfg/alertmanager.yml
+      - name: Every alert has a runbook
+        run: |
+          pip install -q pyyaml
+          python3 - <<'PY'
+          import re, sys, yaml
+          names = [r["alert"] for f in ("prometheus/alerts.yml", "prometheus/alerts-k8s.yml")
+                   for g in yaml.safe_load(open(f))["groups"] for r in g["rules"]]
+          heads = set(re.findall(r"^### (\w+)$", open("docs/RUNBOOKS.md").read(), re.M))
+          missing = [n for n in names if n not in heads]
+          stale = sorted(heads - set(names))
+          print(f"{len(names)} alerts, {len(heads)} runbooks; missing: {missing or 'none'}; for alerts that no longer exist: {stale or 'none'}")
+          if missing or stale:
+              print(f"::error::docs/RUNBOOKS.md must have exactly one '### AlertName' section per alert. Missing: {missing}. Stale: {stale}")
+              sys.exit(1)
+          PY
+      - name: The pager records alerts and reports
+        run: |
+          PAGER_DATA=/tmp/pages.jsonl PAGER_PORT=19099 python3 alerting/pager.py &
+          sleep 2
+          curl -fsS -X POST localhost:19099/alert -d '{"status":"firing","alerts":[{"status":"firing","labels":{"alertname":"ConsumerLagHigh","severity":"page","site":"site-a"},"annotations":{"summary":"behind"}},{"status":"firing","labels":{"alertname":"ProcessorRetrying","severity":"ticket"},"annotations":{}}]}'
+          curl -fsS -X POST localhost:19099/watchdog -d '{}'
+          curl -fsS -X POST localhost:19099/report -d '{"text":"a customer noticed"}'
+          curl -fsS localhost:19099/pages | python3 -c '
+          import json, sys
+          d = json.load(sys.stdin)
+          kinds = [(p["kind"], p["alertname"]) for p in d["pages"]]
+          print(kinds, d["watchdog_age_seconds"])
+          assert kinds == [("page", "ConsumerLagHigh"), ("ticket", "ProcessorRetrying"), ("report", "report")], kinds
+          assert d["pages"][0]["runbook"].endswith("docs/RUNBOOKS.md#consumerlaghigh"), d["pages"][0]
+          assert d["watchdog_age_seconds"] is not None and d["watchdog_age_seconds"] < 30'
+          curl -fsS localhost:19099/ | grep -q "alerting pipeline alive"
+          curl -fsS localhost:19099/pages | python3 scripts/pages.py
       - name: Prometheus config and alert rules
         run: |
           docker run --rm -v "$PWD/prometheus:/etc/prometheus:ro" \
@@ -60,7 +97,7 @@ jobs:
   smoke:
     needs: lint
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 35
     env:
       DEVICE_COUNT: "50"
       SITE_B_DEVICE_COUNT: "30"
@@ -300,9 +337,69 @@ jobs:
           [ "$(dups)" -ge "$recorded" ] || { echo "::error::only $(dups) of $recorded alerts were replayed within 3 minutes"; exit 1; }
           [ "$before" = "$after" ] || { echo "::error::replaying alerts changed the cases: $before -> $after"; exit 1; }
 
+      - name: "Alerting: the heartbeat reaches the pager through Alertmanager"
+        working-directory: connectivity-platform
+        run: |
+          age() { ./scripts/cloud.sh pager GET /pages | python3 -c 'import json,sys; a=json.load(sys.stdin)["watchdog_age_seconds"]; print(-1 if a is None else int(a))'; }
+          for _ in $(seq 1 36); do a=$(age 2>/dev/null || echo -1); [ "$a" -ge 0 ] && [ "$a" -lt 120 ] && break; sleep 5; done
+          a=$(age)
+          [ "$a" -ge 0 ] && [ "$a" -lt 120 ] || { echo "::error::the pager has no recent heartbeat from Alertmanager (age: $a)"; exit 1; }
+          ./scripts/cloud.sh pager GET /pages | python3 scripts/pages.py | tail -n 20
+          echo "::notice title=alerting::Prometheus -> Alertmanager -> pager works: heartbeat ${a}s old"
+
+      - name: "Storage: telemetry is partitioned by hour, and every topic has retention and a dead-letter topic"
+        working-directory: connectivity-platform
+        run: |
+          q() { ./scripts/cloud.sh sql "$1"; }
+          parts=$(q "SELECT count(*) FROM pg_inherits WHERE inhparent = 'telemetry'::regclass")
+          cur=$(q "SELECT count(*) FROM pg_class WHERE relname = 'telemetry_p' || to_char(now() AT TIME ZONE 'UTC', 'YYYYMMDDHH24')")
+          indefault=$(q "SELECT count(*) FROM telemetry_default")
+          echo "telemetry partitions: $parts; this hour's exists: $cur; rows in the default partition: $indefault"
+          [ "$parts" -ge 3 ] && [ "$cur" = 1 ] || { echo "::error::telemetry has $parts partitions and this hour's partition exists=$cur; expected hourly partitions made ahead"; exit 1; }
+          [ "$indefault" = 0 ] || { echo "::error::$indefault rows landed in telemetry_default; partitions were not ready before the consumer started"; exit 1; }
+          topics=$(./scripts/cloud.sh kafka kafka-topics --list | tr -d '\r')
+          for t in telemetry.raw device.events bundles.uploaded device.alerts; do
+            echo "$topics" | grep -qx "$t.dlq" || { echo "::error::topic $t.dlq does not exist"; exit 1; }
+            ./scripts/cloud.sh kafka kafka-configs --describe --entity-type topics --entity-name "$t" | grep -q "retention.bytes" \
+              || { echo "::error::topic $t has no retention.bytes"; exit 1; }
+          done
+          echo "::notice title=storage::$parts telemetry partitions, none of the data in the default; 4 dead-letter topics; retention set on every topic"
+
+      - name: "Poison records: dead-lettered with their reason, and the partition keeps moving"
+        working-directory: connectivity-platform
+        run: |
+          q() { ./scripts/cloud.sh sql "$1"; }
+          ./scripts/drill.sh _apply 08
+          for _ in $(seq 1 24); do
+            n=$(./scripts/cloud.sh dlq telemetry.raw | grep -c "backfill-" || true)
+            [ "$n" -ge 3 ] && break; sleep 5
+          done
+          ./scripts/cloud.sh dlq telemetry.raw | cut -c1-400
+          [ "$n" -ge 3 ] || { echo "::error::only $n of 3 poison records reached telemetry.raw.dlq"; exit 1; }
+          ./scripts/cloud.sh dlq telemetry.raw | grep -q "x-dlq-reason" || { echo "::error::dead letters carry no x-dlq-reason header"; exit 1; }
+          # site-b-00007's partition must still be moving: its batches keep arriving.
+          b0=$(q "SELECT count(*) FROM ingested_batches WHERE device_id = 'site-b-00007'")
+          for _ in $(seq 1 24); do b1=$(q "SELECT count(*) FROM ingested_batches WHERE device_id = 'site-b-00007'"); [ "$b1" -gt "$b0" ] && break; sleep 5; done
+          [ "$b1" -gt "$b0" ] || { echo "::error::no new batches from site-b-00007 after the poison records: its partition is stuck"; exit 1; }
+          echo "::notice title=poison records::$n dead-lettered with x-dlq-reason; the device's batches kept arriving ($b0 -> $b1)"
+
+      - name: "Sealed drills: every scenario applies and undoes cleanly"
+        working-directory: connectivity-platform
+        run: |
+          if ! SELFTEST_HOLD=3 ./scripts/drill.sh selftest > /tmp/selftest.log 2>&1; then
+            cat /tmp/selftest.log
+            echo "::error title=drill self-test failed::$(tail -n 30 /tmp/selftest.log | sed -e ':a' -e 'N' -e '$!ba' -e 's/%/%25/g' -e 's/\r//g' -e 's/\n/%0A/g')"
+            exit 1
+          fi
+          cat /tmp/selftest.log
+          git diff --exit-code -- case-service/rules.json || { echo "::error::a scenario left case-service/rules.json modified"; exit 1; }
+          left=$(./scripts/cloud.sh sql "SELECT count(*) FROM pg_stat_activity WHERE query LIKE '%pg_sleep(5400)%' AND pid <> pg_backend_pid()")
+          [ "$left" = 0 ] || { echo "::error::$left drill sessions are still open in Postgres"; exit 1; }
+          echo "::notice title=sealed drills::$(grep -c 'undo... ok' /tmp/selftest.log) scenarios applied and undone"
+
       - name: Check every Prometheus target is up
         run: |
-          for _ in $(seq 1 24); do
+          for _ in $(seq 1 48); do
             if curl -s localhost:9090/api/v1/targets | python3 -c 'import json,sys; t=json.load(sys.stdin)["data"]["activeTargets"]; h={x["labels"]["job"] + "/" + x["labels"]["instance"]: x["health"] for x in t}; print(h); sys.exit(0 if h and all(v == "up" for v in h.values()) else 1)'; then
               exit 0
             fi
@@ -340,7 +437,7 @@ jobs:
   cluster:
     needs: lint
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 50
     env:
       DEVICE_COUNT: "50"
       SITE_B_DEVICE_COUNT: "30"
@@ -587,7 +684,8 @@ jobs:
           down = [x["labels"]["job"] + "/" + x["labels"].get("pod", x["labels"]["instance"]) for x in t if x["health"] != "up"]
           print(dict(jobs), "down:", down)
           need = {"ingest-api": 2, "telemetry-processor": 2, "case-service": 2, "ai-triage": 2, "kafka": 1, "object-store": 1,
-                  "edge-agent": 2, "site-gateway": 1, "wan": 1, "cadvisor": 3, "kube-state-metrics": 1}
+                  "edge-agent": 2, "site-gateway": 1, "wan": 1, "cadvisor": 3, "kube-state-metrics": 1,
+                  "postgres": 1, "alertmanager": 1, "pager": 1}
           sys.exit(0 if not down and all(jobs[j] >= n for j, n in need.items()) else 1)'; then
               break
             fi
@@ -597,9 +695,21 @@ jobs:
           curl -s localhost:9090/api/v1/rules | python3 -c '
           import json, sys
           names = {r["name"] for g in json.load(sys.stdin)["data"]["groups"] for r in g["rules"]}
-          missing = {"KafkaBrokerMissing", "PodRestarting", "GatewayBacklog", "CaseServiceLag", "TriageSpendRateHigh"} - names
+          missing = {"KafkaBrokerMissing", "PodRestarting", "GatewayBacklog", "CaseServiceLag", "TriageSpendRateHigh",
+                     "DeadLettersWritten", "PostgresVolumeFillingUp", "Watchdog"} - names
           print(len(names), "rules loaded; missing:", missing or "none")
           sys.exit(1 if missing else 0)'
+
+      - name: "Alerting and storage in cluster mode: heartbeat at the pager, hourly partitions, dead-letter topics"
+        run: |
+          age() { ./scripts/cloud.sh pager GET /pages | python3 -c 'import json,sys; a=json.load(sys.stdin)["watchdog_age_seconds"]; print(-1 if a is None else int(a))'; }
+          for _ in $(seq 1 36); do a=$(age 2>/dev/null || echo -1); [ "$a" -ge 0 ] && [ "$a" -lt 120 ] && break; sleep 5; done
+          a=$(age)
+          [ "$a" -ge 0 ] && [ "$a" -lt 120 ] || { echo "::error::the pager has no recent heartbeat from Alertmanager (age: $a)"; exit 1; }
+          parts=$(./scripts/cloud.sh sql "SELECT count(*) FROM pg_inherits WHERE inhparent = 'telemetry'::regclass")
+          [ "$parts" -ge 3 ] || { echo "::error::telemetry has only $parts partitions"; exit 1; }
+          ./scripts/cloud.sh kafka kafka-topics --list | tr -d '\r' | grep -qx "telemetry.raw.dlq" || { echo "::error::telemetry.raw.dlq does not exist"; exit 1; }
+          echo "::notice title=cluster alerting and storage::heartbeat ${a}s old at the pager; $parts telemetry partitions; dead-letter topics exist"
 
       - name: "Chaos Mesh: kill a Kafka broker; it returns, catches up, and nothing is lost"
         run: |

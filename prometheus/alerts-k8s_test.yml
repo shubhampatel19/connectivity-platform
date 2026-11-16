@@ -119,3 +119,17 @@ tests:
             exp_annotations:
               summary: "1 partitions of device.alerts have no leader."
               description: Unclean leader election is off, so these stay offline until a broker holding an in-sync copy returns.
+  - interval: 30s
+    input_series:
+      - series: 'pg_database_size_bytes{job="postgres",datname="connectivity"}'
+        values: '1610612736x30'
+      - series: 'pg_database_size_bytes{job="postgres",datname="postgres"}'
+        values: '0x30'
+    alert_rule_test:
+      - eval_time: 8m
+        alertname: PostgresVolumeFillingUp
+        exp_alerts:
+          - exp_labels: { severity: page }
+            exp_annotations:
+              summary: "Postgres holds 1.5GiB on a 2Gi volume."
+              description: Check that retention is running (RetentionStalled) and what grew, with pg_total_relation_size.

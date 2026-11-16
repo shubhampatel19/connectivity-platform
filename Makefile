@@ -32,7 +32,8 @@ COMPOSE := docker compose
         cases case resolve fault rules replay answers plant \
         triage triages retriage runbooks eval llm-faults \
         wan wan-latency wan-bandwidth wan-flaky wan-blackhole wan-down wan-up wan-clear wan-reset \
-        cluster-up cluster-down deploy edge cluster-status chaos-install chaos chaos-ls chaos-stop
+        cluster-up cluster-down deploy edge cluster-status chaos-install chaos chaos-ls chaos-stop \
+        pages report dlq drill drill-status drill-ack drill-mitigated drill-reveal drill-abort drill-list drill-selftest
 
 bootstrap: ## clone or update every component repo and create go.work
 	./scripts/bootstrap.sh
@@ -203,3 +204,38 @@ eval: ## run triage's evals against a scratch database: make eval [provider=fake
 
 llm-faults: ## make the fake model misbehave, on every replica: make llm-faults spec="rate_limit=0.5,latency_ms=2000" (no spec clears)
 	@$(CLOUD) triage-faults '$(spec)'
+
+# ---------- on call ----------
+pages: ## the pager's timeline: what fired, when, and its runbook: make pages [kind=page|ticket|report]
+	@$(CLOUD) pager GET /pages | python3 scripts/pages.py $(kind)
+
+report: ## add a human report to the timeline (and your phone): make report text="site B says dashboards are empty"
+	@$(CLOUD) pager POST /report "$$(python3 -c 'import json, sys; print(json.dumps({"text": sys.argv[1]}))' '$(text)')"; echo
+
+dlq: ## records a consumer set aside, with the reason in x-dlq-reason: make dlq [t=telemetry.raw]
+	@$(CLOUD) dlq $(or $(t),telemetry.raw)
+
+# ---------- sealed drills ----------
+drill: ## arm a sealed drill: something breaks in the next few minutes and you aren't told what: make drill [n=03]
+	@./scripts/drill.sh start $(n)
+
+drill-status: ## how long the drill has been armed
+	@./scripts/drill.sh status
+
+drill-ack: ## you've noticed and you're on it
+	@./scripts/drill.sh ack
+
+drill-mitigated: ## the damage has stopped
+	@./scripts/drill.sh mitigated
+
+drill-reveal: ## what it was, your timeline, and a postmortem to fill in; undoes whatever is still broken
+	@./scripts/drill.sh reveal
+
+drill-abort: ## undo the drill without being told what it was
+	@./scripts/drill.sh abort
+
+drill-list: ## how many scenarios there are and which you've done
+	@./scripts/drill.sh list
+
+drill-selftest: ## apply and undo every scenario once, against the running stack
+	@./scripts/drill.sh selftest

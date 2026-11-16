@@ -14,6 +14,12 @@
 #   cloud.sh replay                       reprocess every alert from offset 0
 #   cloud.sh triage-eval <provider> <n>   AI triage's evals, n runs per case
 #   cloud.sh triage-faults <spec>         the fake model's faults, on every replica
+#   cloud.sh pager GET|POST <path> [json] ask the pager (timeline, reports)
+#   cloud.sh dlq <topic>                  read a topic's dead-letter topic, with headers
+#   cloud.sh setenv <service> NAME=value  run a service with one setting changed
+#   cloud.sh resetenv <service> NAME      put that setting back to its default
+#   cloud.sh bgsql "<statements>"         run SQL in a session that stays open
+#   cloud.sh kafka-in <tool> [args...]    like kafka, with stdin passed through
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -173,6 +179,113 @@ print(urllib.request.urlopen(urllib.request.Request("http://localhost:8086/debug
   fi
 }
 
+# The pager, from wherever it can be reached. Its host port exists in compose
+# mode and on clusters created since it was added; on an older cluster, ask
+# it from inside its own pod.
+pager() {
+  local method=$1 path=$2 body=${3:-}
+  local args=(-fsS --max-time 5 -X "$method")
+  [ -z "$body" ] || args+=(-H 'Content-Type: application/json' --data "$body")
+  if curl "${args[@]}" "localhost:9099$path" 2> /dev/null; then return; fi
+  [ "$MODE" = cluster ] || { echo "the pager is not reachable on localhost:9099" >&2; return 1; }
+  k exec deployment/pager -- python -c 'import sys, urllib.request
+method, path, body = sys.argv[1], sys.argv[2], sys.argv[3]
+req = urllib.request.Request("http://localhost:9099" + path, data=body.encode() or None, method=method)
+print(urllib.request.urlopen(req, timeout=5).read().decode())' "$method" "$path" "$body"
+}
+
+# Everything in a topic's dead-letter topic: where each record came from, why
+# it was set aside (the x-dlq-* headers), its key and its value.
+dlq() {
+  local topic=${1:-telemetry.raw}
+  kafka kafka-console-consumer --topic "${topic%.dlq}.dlq" --from-beginning --timeout-ms 8000 \
+    --property print.offset=true --property print.headers=true --property print.key=true 2> /dev/null || true
+}
+
+kafka_in() {
+  local tool=$1; shift
+  if [ "$MODE" = cluster ]; then
+    local b; b=$(broker)
+    [ -n "$b" ] || { echo "no Kafka broker is ready" >&2; exit 1; }
+    k exec -i "$b" -- "/opt/kafka/bin/$tool.sh" --bootstrap-server localhost:9092 "$@"
+  else
+    compose exec -T kafka "/opt/kafka/bin/$tool.sh" --bootstrap-server localhost:9092 "$@"
+  fi
+}
+
+# One setting of one service, changed and later put back. In cluster mode a
+# cloud service's Deployment gets the variable directly. In Compose the
+# setting must be one docker-compose.yml reads from the environment; those
+# are remembered in .drills/overrides.env so that changing a second setting
+# doesn't undo the first. (A plain `make up` ignores that file, and so puts
+# every service back to its defaults.)
+compose_var() {
+  case "$1/$2" in
+    ingest-api/PRODUCE_TIMEOUT) echo INGEST_PRODUCE_TIMEOUT ;;
+    ingest-api/MAX_IN_FLIGHT) echo INGEST_MAX_IN_FLIGHT ;;
+    ingest-api/TOKEN_SECRET | ingest-api/ENROLLMENT_KEY) echo "$2" ;;
+    telemetry-processor/CONSUMER_GROUP) echo PROCESSOR_CONSUMER_GROUP ;;
+    telemetry-processor/TELEMETRY_RETENTION | telemetry-processor/BATCH_ID_RETENTION) echo "$2" ;;
+    edge-agent/CLOCK_SKEW_MAX | edge-agent-site-b/CLOCK_SKEW_MAX) echo CLOCK_SKEW_MAX ;;
+    edge-agent/FIRMWARE_MIX | edge-agent-site-b/FIRMWARE_MIX) echo FIRMWARE_MIX ;;
+    *) echo "no compose variable for $2 on $1; add one to docker-compose.yml and scripts/cloud.sh" >&2; return 1 ;;
+  esac
+}
+
+compose_apply_overrides() {
+  local svc=$1 f=.drills/overrides.env
+  mkdir -p .drills && touch "$f"
+  (
+    set -a
+    # shellcheck disable=SC1090
+    . "./$f"
+    set +a
+    compose up -d --no-deps "$svc"
+  )
+}
+
+setenv() {
+  local svc=$1 name=${2%%=*} value=${2#*=}
+  if on_cluster "$svc"; then
+    k set env "deployment/$svc" "$name=$value" > /dev/null
+    k rollout status "deployment/$svc" --timeout=5m > /dev/null
+    return
+  fi
+  local var f=.drills/overrides.env
+  var=$(compose_var "$svc" "$name")
+  mkdir -p .drills && touch "$f"
+  grep -v "^$var=" "$f" > "$f.tmp" || true
+  printf "%s='%s'\n" "$var" "$value" >> "$f.tmp"
+  mv "$f.tmp" "$f"
+  compose_apply_overrides "$svc" > /dev/null 2>&1
+}
+
+resetenv() {
+  local svc=$1 name=$2
+  if on_cluster "$svc"; then
+    k set env "deployment/$svc" "$name-" > /dev/null
+    k rollout status "deployment/$svc" --timeout=5m > /dev/null
+    return
+  fi
+  local var f=.drills/overrides.env
+  var=$(compose_var "$svc" "$name")
+  mkdir -p .drills && touch "$f"
+  grep -v "^$var=" "$f" > "$f.tmp" || true
+  mv "$f.tmp" "$f"
+  compose_apply_overrides "$svc" > /dev/null 2>&1
+}
+
+# SQL in a session that outlives this command: for a lock or a transaction
+# that has to stay open.
+bgsql() {
+  if [ "$MODE" = cluster ]; then
+    # shellcheck disable=SC2016
+    k exec postgres-0 -- sh -c 'nohup psql -U connectivity -d connectivity -c "$1" > /dev/null 2>&1 &' sh "$1"
+  else
+    compose exec -d postgres "${psql_args[@]}" -c "$1"
+  fi
+}
+
 verb=${1:-}; shift || true
 case "$verb" in
   sql) sql "$1" ;;
@@ -188,5 +301,12 @@ case "$verb" in
   replay) replay ;;
   triage-eval) triage_eval "${1:-fake}" "${2:-1}" ;;
   triage-faults) triage_faults "${1:-}" ;;
-  *) sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+  pager) pager "$@" ;;
+  dlq) dlq "${1:-}" ;;
+  setenv) setenv "$1" "$2" ;;
+  resetenv) resetenv "$1" "$2" ;;
+  bgsql) bgsql "$1" ;;
+  kafka-in) kafka_in "$@" ;;
+  mode) echo "$MODE" ;;
+  *) sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
 esac

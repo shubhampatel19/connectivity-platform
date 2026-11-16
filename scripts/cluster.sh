@@ -83,6 +83,12 @@ YAML
     echo "==> AI triage will use its fake model (set ANTHROPIC_API_KEY to use Claude)"
   fi
 
+  # Where the pager sends pages: your phone, if NTFY_URL is set.
+  if [ -n "${NTFY_URL:-}" ]; then
+    k create secret generic pager --from-literal=NTFY_URL="$NTFY_URL" --dry-run=client -o yaml | k apply -f - > /dev/null
+    echo "==> the pager will notify $NTFY_URL"
+  fi
+
   echo "==> apply manifests"
   # The topic Job is rerun on every deploy (it is idempotent); a finished Job
   # can't be updated in place.

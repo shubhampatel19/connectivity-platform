@@ -9,6 +9,7 @@
 #   8085 case service API   8086 AI triage API   3000 Grafana   9090 Prometheus
 #   8888 object store filer 2333 Chaos Mesh dashboard (after `make chaos-install`)
 #   4318 Tempo's OTLP endpoint, where the edge agents send their spans
+#   9093 Alertmanager       9099 the pager's incident timeline
 apiVersion: k3d.io/v1alpha5
 kind: Simple
 metadata:
@@ -32,6 +33,10 @@ ports:
   - port: 2333:30233
     nodeFilters: [loadbalancer]
   - port: 4318:30418
+    nodeFilters: [loadbalancer]
+  - port: 9093:30093
+    nodeFilters: [loadbalancer]
+  - port: 9099:30099
     nodeFilters: [loadbalancer]
 options:
   k3d:

@@ -13,6 +13,9 @@
 # runs on k3d instead, and only the edge and the WAN start from here, with
 # WAN_UPSTREAM pointing at the cluster's ingress.
 #
+# Alerts go from Prometheus to Alertmanager to the pager, which keeps the
+# incident timeline and can notify a phone.
+#
 # Service images build from sibling clones of each component repo. Run
 # scripts/bootstrap.sh once to set up that layout.
 name: connectivity
@@ -69,10 +72,21 @@ services:
     command:
       - |
         set -e
-        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic telemetry.raw --partitions 6 --replication-factor 1
-        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic device.events --partitions 3 --replication-factor 1
-        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic bundles.uploaded --partitions 3 --replication-factor 1
-        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic device.alerts --partitions 3 --replication-factor 1
+        k=/opt/kafka/bin/kafka-topics.sh; c=/opt/kafka/bin/kafka-configs.sh; b=kafka:9092
+        # name:partitions. Each source topic has a dead-letter topic, where a
+        # consumer puts a record it can never process (see `make dlq`).
+        for t in telemetry.raw:6 device.events:3 bundles.uploaded:3 device.alerts:3; do
+          $$k --bootstrap-server $$b --create --if-not-exists --topic "$${t%:*}" --partitions "$${t#*:}" --replication-factor 1
+          $$k --bootstrap-server $$b --create --if-not-exists --topic "$${t%:*}.dlq" --partitions 1 --replication-factor 1
+        done
+        # Retention, set on every start so an existing topic gets it too. Time
+        # bounds how far back a replay can go; bytes (per partition) bounds the
+        # disk whatever the traffic does. Dead letters are kept a week: they
+        # are rare, and someone has to get round to reading them.
+        for t in telemetry.raw device.events bundles.uploaded device.alerts; do
+          $$c --bootstrap-server $$b --alter --entity-type topics --entity-name "$$t" --add-config "retention.ms=${KAFKA_RETENTION_MS:-43200000},retention.bytes=${KAFKA_RETENTION_BYTES:-268435456}"
+          $$c --bootstrap-server $$b --alter --entity-type topics --entity-name "$$t.dlq" --add-config "retention.ms=604800000,retention.bytes=67108864"
+        done
         echo "topics ready"
     restart: "no"
 
@@ -132,6 +146,8 @@ services:
       S3_ACCESS_KEY: ${S3_ACCESS_KEY:-connectivity}
       S3_SECRET_KEY: ${S3_SECRET_KEY:-connectivity-secret}
       S3_BUCKET: log-bundles
+      PRODUCE_TIMEOUT: ${INGEST_PRODUCE_TIMEOUT:-5s}
+      MAX_IN_FLIGHT: ${INGEST_MAX_IN_FLIGHT:-512}
       LOG_LEVEL: ${INGEST_LOG_LEVEL:-info}
     ports:
       - "8080:8080"
@@ -148,6 +164,15 @@ services:
     environment:
       KAFKA_BROKERS: kafka:9092
       DATABASE_URL: postgres://connectivity:connectivity@postgres:5432/connectivity?sslmode=disable
+      CONSUMER_GROUP: ${PROCESSOR_CONSUMER_GROUP:-telemetry-processor}
+      # Telemetry is partitioned by hour and dropped after this long. Batch
+      # markers (what makes a replay a no-op) must outlive both the telemetry
+      # and Kafka's retention, or a replayed batch would be stored twice.
+      # Measured: the default fleet writes about 235 MB of telemetry and
+      # 40 MB of batch markers an hour, so these defaults hold the database
+      # near 2 GB. Kafka keeps 12 hours (KAFKA_RETENTION_MS).
+      TELEMETRY_RETENTION: ${TELEMETRY_RETENTION:-6h}
+      BATCH_ID_RETENTION: ${BATCH_ID_RETENTION:-13h}
       LOG_LEVEL: ${PROCESSOR_LOG_LEVEL:-info}
     ports:
       - "9101:9101"
@@ -242,6 +267,10 @@ services:
       OTEL_TRACES_SAMPLER: parentbased_traceidratio
       OTEL_TRACES_SAMPLER_ARG: ${TRACE_SAMPLE_RATIO:-0.1}
       OTEL_RESOURCE_ATTRIBUTES: site.id=site-a
+      # A real fleet is never uniform: two firmware versions partway through
+      # a rollout, and clocks that are each a little wrong.
+      FIRMWARE_MIX: ${FIRMWARE_MIX:-1.4.2=70,1.5.0=30}
+      CLOCK_SKEW_MAX: ${CLOCK_SKEW_MAX:-20s}
       DEVICE_COUNT: ${DEVICE_COUNT:-200}
       SEND_INTERVAL: ${SEND_INTERVAL:-5s}
       BUNDLE_INTERVAL: ${BUNDLE_INTERVAL:-30m}
@@ -289,6 +318,10 @@ services:
       OTEL_TRACES_SAMPLER: parentbased_traceidratio
       OTEL_TRACES_SAMPLER_ARG: ${TRACE_SAMPLE_RATIO:-0.1}
       OTEL_RESOURCE_ATTRIBUTES: site.id=site-b
+      # A real fleet is never uniform: two firmware versions partway through
+      # a rollout, and clocks that are each a little wrong.
+      FIRMWARE_MIX: ${FIRMWARE_MIX:-1.4.2=70,1.5.0=30}
+      CLOCK_SKEW_MAX: ${CLOCK_SKEW_MAX:-20s}
       DEVICE_COUNT: ${SITE_B_DEVICE_COUNT:-100}
       SEND_INTERVAL: ${SEND_INTERVAL:-5s}
       BUNDLE_INTERVAL: ${BUNDLE_INTERVAL:-30m}
@@ -312,6 +345,16 @@ services:
       kafka-init: { condition: service_completed_successfully }
     restart: unless-stopped
 
+  # Database size, connections and locks, as job "postgres".
+  postgres-exporter:
+    profiles: [cloud]
+    image: prometheuscommunity/postgres-exporter:v0.15.0
+    environment:
+      DATA_SOURCE_NAME: postgresql://connectivity:connectivity@postgres:5432/connectivity?sslmode=disable
+    depends_on:
+      postgres: { condition: service_healthy }
+    restart: unless-stopped
+
   prometheus:
     profiles: [cloud]
     image: prom/prometheus:v2.53.0
@@ -320,6 +363,35 @@ services:
       - ./prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
     ports:
       - "9090:9090"
+    restart: unless-stopped
+
+  # Routes firing alerts to the pager: pages and tickets, grouped so one
+  # failure is one notification. http://localhost:9093 shows what is firing
+  # and lets you silence it.
+  alertmanager:
+    profiles: [cloud]
+    image: prom/alertmanager:v0.27.0
+    command: ["--config.file=/etc/alertmanager/alertmanager.yml", "--storage.path=/alertmanager"]
+    volumes:
+      - ./alerting/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+    ports:
+      - "9093:9093"
+    restart: unless-stopped
+
+  # Keeps the incident timeline (http://localhost:9099, or `make pages`) and
+  # sends pages to your phone when NTFY_URL is set, e.g.
+  # NTFY_URL=https://ntfy.sh/<a-topic-name-only-you-know> make up
+  pager:
+    profiles: [cloud]
+    image: python:3.12-alpine
+    command: ["python", "-u", "/app/pager.py"]
+    environment:
+      NTFY_URL: ${NTFY_URL:-}
+    volumes:
+      - ./alerting/pager.py:/app/pager.py:ro
+      - pager-data:/data
+    ports:
+      - "9099:9099"
     restart: unless-stopped
 
   grafana:
@@ -340,5 +412,6 @@ services:
 
 volumes:
   pg-data:
+  pager-data:
   object-data:
   gateway-data:

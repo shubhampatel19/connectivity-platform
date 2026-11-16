@@ -33,6 +33,12 @@ spec:
             - { name: KAFKA_BROKERS, value: "kafka:9092" }
             - name: DATABASE_URL
               valueFrom: { secretKeyRef: { name: connectivity, key: DATABASE_URL } }
+            # Postgres has a 2Gi volume here and the fleet writes about
+            # 235 MB of telemetry an hour, so it is kept for less time than in
+            # compose mode. Batch markers must outlive both the telemetry and
+            # Kafka's 3h retention.
+            - { name: TELEMETRY_RETENTION, value: 2h }
+            - { name: BATCH_ID_RETENTION, value: 4h }
             - { name: LOG_LEVEL, value: info }
             # Spans go to Tempo. The sampling decision is the device's
             # (parent-based), so a trace is either whole or absent.
